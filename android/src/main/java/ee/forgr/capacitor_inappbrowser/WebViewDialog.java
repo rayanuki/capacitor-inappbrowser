@@ -331,8 +331,10 @@ public class WebViewDialog extends Dialog {
             View appBar = findViewById(R.id.app_bar_layout);
             if (appBar != null) appBar.setFitsSystemWindows(true);
         }
-
-        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        // [Rayanuki] Keep app fullscreen if toolBarType = "blank"  
+        if(_options != null && _options.getToolbarType() != null && !TextUtils.equals(_options.getToolbarType(), "blank")){
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        }
 
         // Make status bar transparent
         if (getWindow() != null) {
@@ -356,9 +358,12 @@ public class WebViewDialog extends Dialog {
                 .post(() -> {
                     // Get status bar height
                     int statusBarHeight = 0;
-                    int resourceId = getContext().getResources().getIdentifier("status_bar_height", "dimen", "android");
-                    if (resourceId > 0) {
-                        statusBarHeight = getContext().getResources().getDimensionPixelSize(resourceId);
+                    // [Rayanuki] Keep app fullscreen if toolBarType = "blank"  
+                    if(_options != null && _options.getToolbarType() != null && !TextUtils.equals(_options.getToolbarType(), "blank")){
+                        int resourceId = getContext().getResources().getIdentifier("status_bar_height", "dimen", "android");
+                        if (resourceId > 0) {
+                            statusBarHeight = getContext().getResources().getDimensionPixelSize(resourceId);
+                        }
                     }
 
                     // Find the status bar color view
@@ -1121,9 +1126,12 @@ public class WebViewDialog extends Dialog {
                 _webView.post(() -> {
                     // Get status bar height
                     int statusBarHeight = 0;
-                    int resourceId = getContext().getResources().getIdentifier("status_bar_height", "dimen", "android");
-                    if (resourceId > 0) {
-                        statusBarHeight = getContext().getResources().getDimensionPixelSize(resourceId);
+                    // [Rayanuki] Keep app fullscreen if toolBarType = "blank"  
+                    if(_options != null && _options.getToolbarType() != null && !TextUtils.equals(_options.getToolbarType(), "blank")){   
+                        int resourceId = getContext().getResources().getIdentifier("status_bar_height", "dimen", "android");
+                        if (resourceId > 0) {
+                            statusBarHeight = getContext().getResources().getDimensionPixelSize(resourceId);
+                        }
                     }
 
                     // Fix status bar view

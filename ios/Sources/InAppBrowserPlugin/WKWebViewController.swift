@@ -718,13 +718,16 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
         // Then set up constraints
         webView.translatesAutoresizingMaskIntoConstraints = false
         var bottomPadding = self.view.bottomAnchor
-
+        // [RAYANUKI] make the entire page fullscreen if enabledSafeBottomMargin = false
+        var topPadding = self.view.topAnchor;
         if self.enabledSafeBottomMargin {
+        // [RAYANUKI] make the entire page fullscreen if enabledSafeBottomMargin = false
             bottomPadding = self.view.safeAreaLayoutGuide.bottomAnchor
+            topPadding = self.view.safeAreaLayoutGuide.topAnchor
         }
 
         NSLayoutConstraint.activate([
-            webView.topAnchor.constraint(equalTo: self.view.safeAreaLayoutGuide.topAnchor),
+            webView.topAnchor.constraint(equalTo: topPadding),
             webView.leadingAnchor.constraint(equalTo: self.view.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: self.view.trailingAnchor),
             webView.bottomAnchor.constraint(equalTo: bottomPadding)
@@ -810,7 +813,10 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
     }
 
     override open func viewWillLayoutSubviews() {
-        restateViewHeight()
+        // [RAYANUKI] make the entire page fullscreen if enabledSafeBottomMargin = false
+        if self.enabledSafeBottomMargin {
+             restateViewHeight()
+        }
         // Don't override frame height when enabledSafeBottomMargin is true, as it would override our constraints
         if self.currentViewHeight != nil && !self.enabledSafeBottomMargin {
             self.view.frame.size.height = self.currentViewHeight!
