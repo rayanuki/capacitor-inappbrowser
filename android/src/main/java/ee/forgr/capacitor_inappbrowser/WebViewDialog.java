@@ -334,9 +334,10 @@ public class WebViewDialog extends Dialog {
         );
         setContentView(R.layout.activity_browser);
 
+        Window window = getWindow();
+
         // If custom dimensions are set, configure for touch passthrough
         if (_options != null && (_options.getWidth() != null || _options.getHeight() != null)) {
-            Window window = getWindow();
             if (window != null) {
                 // Make the dialog background transparent
                 window.setBackgroundDrawableResource(android.R.color.transparent);
@@ -353,6 +354,34 @@ public class WebViewDialog extends Dialog {
             if (coordinator != null) coordinator.setFitsSystemWindows(true);
             View appBar = findViewById(R.id.app_bar_layout);
             if (appBar != null) appBar.setFitsSystemWindows(true);
+        }
+
+        // [Rayanuki] Keep app fullscreen if toolBarType = "blank"  
+        if(_options != null && _options.getToolbarType() != null && !TextUtils.equals(_options.getToolbarType(), "blank")){
+            if (window != null) {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+            }
+        }else{
+            if (window != null) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    window.setDecorFitsSystemWindows(false);
+                    final View decorView = window.getDecorView();
+                    decorView.getWindowInsetsController().hide(android.view.WindowInsets.Type.statusBars() | android.view.WindowInsets.Type.navigationBars());
+                    decorView.getWindowInsetsController().setSystemBarsBehavior(
+                        android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    );
+                } else {
+                    final View decorView = window.getDecorView();
+                    decorView.setSystemUiVisibility(
+                        View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                        | View.SYSTEM_UI_FLAG_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    );
+                }
+            }
         }
 
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
@@ -379,9 +408,12 @@ public class WebViewDialog extends Dialog {
                 .post(() -> {
                     // Get status bar height
                     int statusBarHeight = 0;
-                    int resourceId = getContext().getResources().getIdentifier("status_bar_height", "dimen", "android");
-                    if (resourceId > 0) {
-                        statusBarHeight = getContext().getResources().getDimensionPixelSize(resourceId);
+                    // [Rayanuki] Keep app fullscreen if toolBarType = "blank"  
+                    if(_options != null && _options.getToolbarType() != null && !TextUtils.equals(_options.getToolbarType(), "blank")){
+                        int resourceId = getContext().getResources().getIdentifier("status_bar_height", "dimen", "android");
+                        if (resourceId > 0) {
+                            statusBarHeight = getContext().getResources().getDimensionPixelSize(resourceId);
+                        }
                     }
 
                     // Find the status bar color view
@@ -1176,9 +1208,12 @@ public class WebViewDialog extends Dialog {
                 _webView.post(() -> {
                     // Get status bar height
                     int statusBarHeight = 0;
-                    int resourceId = getContext().getResources().getIdentifier("status_bar_height", "dimen", "android");
-                    if (resourceId > 0) {
-                        statusBarHeight = getContext().getResources().getDimensionPixelSize(resourceId);
+                    // [Rayanuki] Keep app fullscreen if toolBarType = "blank"  
+                    if(_options != null && _options.getToolbarType() != null && !TextUtils.equals(_options.getToolbarType(), "blank")){   
+                        int resourceId = getContext().getResources().getIdentifier("status_bar_height", "dimen", "android");
+                        if (resourceId > 0) {
+                            statusBarHeight = getContext().getResources().getDimensionPixelSize(resourceId);
+                        }
                     }
 
                     // Fix status bar view

@@ -835,7 +835,10 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
     }
 
     override open func viewWillLayoutSubviews() {
-        restateViewHeight()
+        // [RAYANUKI] make the entire page fullscreen if enabledSafeBottomMargin = false
+        if self.enabledSafeBottomMargin {
+             restateViewHeight()
+        }
         // Don't override frame height when enabledSafeBottomMargin is true, as it would override our constraints
         if self.currentViewHeight != nil && !self.enabledSafeBottomMargin {
             self.view.frame.size.height = self.currentViewHeight!
