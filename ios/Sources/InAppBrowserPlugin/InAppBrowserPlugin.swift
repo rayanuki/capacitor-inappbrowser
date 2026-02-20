@@ -29,7 +29,11 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         case aware = "AWARE"
         case fakeVisible = "FAKE_VISIBLE"
     }
+<<<<<<< HEAD
     private let pluginVersion: String = "8.1.21"
+=======
+    private let pluginVersion: String = "8.1.18"
+>>>>>>> 5652421 (chore(release): 8.1.18)
     public let identifier = "InAppBrowserPlugin"
     public let jsName = "InAppBrowser"
     public let pluginMethods: [CAPPluginMethod] = [
