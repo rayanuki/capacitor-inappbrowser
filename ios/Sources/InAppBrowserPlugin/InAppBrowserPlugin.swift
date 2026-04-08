@@ -29,7 +29,7 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         case aware = "AWARE"
         case fakeVisible = "FAKE_VISIBLE"
     }
-    private let pluginVersion: String = "8.1.23"
+    private let pluginVersion: String = "8.5.2"
     public let identifier = "InAppBrowserPlugin"
     public let jsName = "InAppBrowser"
     public let pluginMethods: [CAPPluginMethod] = [
@@ -47,9 +47,12 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "close", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "executeScript", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "postMessage", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "takeScreenshot", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "updateDimensions", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setEnabledSafeTopMargin", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setEnabledSafeBottomMargin", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getPluginVersion", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "openSecureWindow", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "openSecureWindow", returnType: CAPPluginReturnPromise)
     ]
     var navigationWebViewController: UINavigationController?
     private var navigationControllers: [String: UINavigationController] = [:]
@@ -159,7 +162,7 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
     private func activeWindow() -> UIWindow? {
         return UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }
-            .first { $0.activationState == .foregroundActive }?
+            .first { $0.activationState == .foregroundActive || $0.activationState == .foregroundInactive }?
             .windows
             .first { $0.isKeyWindow }
     }
@@ -374,9 +377,11 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         }
 
         let webViewId = UUID().uuidString
+        let showScreenshotButton = call.getBool("showScreenshotButton", false)
+        let buttonNearDoneSettings = call.getObject("buttonNearDone")
 
         var buttonNearDoneIcon: UIImage?
-        if let buttonNearDoneSettings = call.getObject("buttonNearDone") {
+        if let buttonNearDoneSettings {
             guard let iosSettingsRaw = buttonNearDoneSettings["ios"] else {
                 call.reject("IOS settings not found")
                 return
@@ -405,7 +410,7 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
             } else {
                 // Look in app's web assets/public directory
                 guard let webDir = Bundle.main.resourceURL?.appendingPathComponent("public") else {
-                    print("[DEBUG] Failed to locate web assets directory")
+                    call.reject("Failed to locate bundled web assets")
                     return
                 }
 
@@ -460,35 +465,15 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
                 }
 
                 if !foundImage {
-                    print("[DEBUG] Failed to load buttonNearDone icon: \(icon)")
-
-                    // Debug info
-                    if let resourceURL = Bundle.main.resourceURL {
-                        print("[DEBUG] Resource URL: \(resourceURL.path)")
-
-                        // List directories to help debugging
-                        do {
-                            let contents = try FileManager.default.contentsOfDirectory(atPath: resourceURL.path)
-                            print("[DEBUG] Root bundle contents: \(contents)")
-
-                            // Check if public or www directories exist
-                            if contents.contains("public") {
-                                let publicContents = try FileManager.default.contentsOfDirectory(
-                                    atPath: resourceURL.appendingPathComponent("public").path)
-                                print("[DEBUG] Public dir contents: \(publicContents)")
-                            }
-
-                            if contents.contains("www") {
-                                let wwwContents = try FileManager.default.contentsOfDirectory(
-                                    atPath: resourceURL.appendingPathComponent("www").path)
-                                print("[DEBUG] WWW dir contents: \(wwwContents)")
-                            }
-                        } catch {
-                            print("[DEBUG] Error listing directories: \(error)")
-                        }
-                    }
+                    call.reject("Failed to load buttonNearDone icon: \(icon)")
+                    return
                 }
             }
+        }
+
+        if showScreenshotButton, buttonNearDoneSettings != nil {
+            call.reject("showScreenshotButton is not compatible with buttonNearDone")
+            return
         }
 
         let headers = call.getObject("headers", [:]).mapValues { String(describing: $0 as Any) }
@@ -497,6 +482,7 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         let closeModalDescription = call.getString("closeModalDescription", "Are you sure you want to close this window?")
         let closeModalOk = call.getString("closeModalOk", "OK")
         let closeModalCancel = call.getString("closeModalCancel", "Cancel")
+        let closeModalURLPattern = call.getString("closeModalURLPattern")
         let isInspectable = call.getBool("isInspectable", false)
         let preventDeeplink = call.getBool("preventDeeplink", false)
         let isAnimated = call.getBool("isAnimated", true)
@@ -505,6 +491,7 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         let hidden = call.getBool("hidden", false)
         self.isHidden = hidden
         let allowWebViewJsVisibilityControl = self.getConfig().getBoolean("allowWebViewJsVisibilityControl", false)
+        let allowScreenshotsFromWebPage = call.getBool("allowScreenshotsFromWebPage", false)
         let invisibilityModeRaw = call.getString("invisibilityMode", "AWARE")
         self.invisibilityMode = InvisibilityMode(rawValue: invisibilityModeRaw.uppercased()) ?? .aware
 
@@ -526,12 +513,19 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
                 self.closeModalOk = closeModalOk
                 self.closeModalCancel = closeModalCancel
             }
+            if let pattern = closeModalURLPattern {
+                if (try? NSRegularExpression(pattern: pattern)) == nil {
+                    call.reject("Invalid closeModalURLPattern regex")
+                    return
+                }
+            }
         } else {
             // Reject if closeModal is false but closeModal options are provided
             if call.getString("closeModalTitle") != nil ||
                 call.getString("closeModalDescription") != nil ||
                 call.getString("closeModalOk") != nil ||
-                call.getString("closeModalCancel") != nil {
+                call.getString("closeModalCancel") != nil ||
+                call.getString("closeModalURLPattern") != nil {
                 call.reject("closeModal options require closeModal to be true")
                 return
             }
@@ -544,10 +538,11 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         }
 
         // Validate buttonNearDone compatibility with toolbar type
-        if call.getString("buttonNearDone") != nil {
+        if buttonNearDoneSettings != nil || showScreenshotButton {
             let toolbarType = call.getString("toolbarType", "")
             if toolbarType == "activity" || toolbarType == "navigation" || toolbarType == "blank" {
-                call.reject("buttonNearDone is not compatible with toolbarType: " + toolbarType)
+                let optionName = showScreenshotButton ? "showScreenshotButton" : "buttonNearDone"
+                call.reject(optionName + " is not compatible with toolbarType: " + toolbarType)
                 return
             }
         }
@@ -616,16 +611,16 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
                 enabledSafeTopMargin: enabledSafeTopMargin,
                 blockedHosts: blockedHosts,
                 authorizedAppLinks: authorizedAppLinks,
-                )
+                allowWebViewJsVisibilityControl: allowWebViewJsVisibilityControl,
+                allowScreenshotsFromWebPage: allowScreenshotsFromWebPage
+            )
 
             guard let webViewController = self.webViewController else {
                 call.reject("Failed to initialize WebViewController")
                 return
             }
 
-            webViewController.allowWebViewJsVisibilityControl = allowWebViewJsVisibilityControl
             webViewController.instanceId = webViewId
-            webViewController.allowWebViewJsVisibilityControl = allowWebViewJsVisibilityControl
 
             // Set HTTP method and body if provided
             if let method = httpMethod {
@@ -739,7 +734,10 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
             if let buttonNearDoneIcon = buttonNearDoneIcon {
                 webViewController.buttonNearDoneIcon = buttonNearDoneIcon
                 print("[DEBUG] Button near done icon set: \(buttonNearDoneIcon)")
+            } else if showScreenshotButton {
+                webViewController.buttonNearDoneIcon = UIImage(systemName: "camera")?.withRenderingMode(.alwaysTemplate)
             }
+            webViewController.showScreenshotButton = showScreenshotButton
 
             webViewController.capBrowserPlugin = self
             webViewController.title = call.getString("title", "New Window")
@@ -782,6 +780,9 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
                 webViewController.closeModalDescription = self.closeModalDescription ?? closeModalDescription
                 webViewController.closeModalOk = self.closeModalOk ?? closeModalOk
                 webViewController.closeModalCancel = self.closeModalCancel ?? closeModalCancel
+                if let pattern = closeModalURLPattern {
+                    webViewController.closeModalURLPattern = pattern
+                }
             }
 
             self.navigationWebViewController = UINavigationController.init(rootViewController: webViewController)
@@ -1129,6 +1130,25 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
+    @objc func takeScreenshot(_ call: CAPPluginCall) {
+        DispatchQueue.main.async {
+            let targetId = call.getString("id") ?? self.activeWebViewId
+            guard let webViewController = self.resolveWebViewController(for: targetId) else {
+                call.reject("WebView is not initialized")
+                return
+            }
+
+            webViewController.takeScreenshot { result in
+                switch result {
+                case .success(let screenshot):
+                    call.resolve(screenshot)
+                case .failure(let error):
+                    call.reject(error.localizedDescription)
+                }
+            }
+        }
+    }
+
     func isHexColorCode(_ input: String) -> Bool {
         let hexColorRegex = "^#([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})$"
 
@@ -1357,6 +1377,38 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
+    @objc func setEnabledSafeTopMargin(_ call: CAPPluginCall) {
+        if call.options["enabled"] == nil {
+            print("[InAppBrowser][Warning] setEnabledSafeTopMargin called without 'enabled'; defaulting to true")
+        }
+        let enabled = call.getBool("enabled", true)
+        DispatchQueue.main.async {
+            let targetId = call.getString("id") ?? self.activeWebViewId
+            guard let webViewController = self.resolveWebViewController(for: targetId) else {
+                call.reject("WebView is not initialized")
+                return
+            }
+            webViewController.updateSafeTopMargin(enabled)
+            call.resolve()
+        }
+    }
+
+    @objc func setEnabledSafeBottomMargin(_ call: CAPPluginCall) {
+        if call.options["enabled"] == nil {
+            print("[InAppBrowser][Warning] setEnabledSafeBottomMargin called without 'enabled'; defaulting to false")
+        }
+        let enabled = call.getBool("enabled", false)
+        DispatchQueue.main.async {
+            let targetId = call.getString("id") ?? self.activeWebViewId
+            guard let webViewController = self.resolveWebViewController(for: targetId) else {
+                call.reject("WebView is not initialized")
+                return
+            }
+            webViewController.updateSafeBottomMargin(enabled)
+            call.resolve()
+        }
+    }
+
     @objc func openSecureWindow(_ call: CAPPluginCall) {
         guard let urlString = call.getString("authEndpoint") else {
             call.reject("authEndpoint is required")
@@ -1375,6 +1427,8 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
 
         // Store the call for later resolution
         self.openSecureWindowCall = call
+
+        let prefersEphemeral = call.getBool("prefersEphemeralWebBrowserSession") ?? false
 
         // Open the URL in a secure browser window
         DispatchQueue.main.async {
@@ -1405,6 +1459,7 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
             }
 
             // Present the session
+            session.prefersEphemeralWebBrowserSession = prefersEphemeral
             session.presentationContextProvider = self
             session.start()
         }

@@ -21,6 +21,8 @@ import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Build;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.print.PrintAttributes;
 import android.print.PrintDocumentAdapter;
 import android.print.PrintManager;
@@ -65,7 +67,9 @@ import androidx.webkit.WebViewFeature;
 import com.caverock.androidsvg.SVG;
 import com.caverock.androidsvg.SVGParseException;
 import com.getcapacitor.JSObject;
+import com.getcapacitor.PluginCall;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -85,6 +89,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.json.JSONException;
@@ -135,6 +140,9 @@ public class WebViewDialog extends Dialog {
     public static final int FILE_CHOOSER_REQUEST_CODE = 1000;
     public ValueCallback<Uri> mUploadMessage;
     public ValueCallback<Uri[]> mFilePathCallback;
+    private boolean openWebViewResolved;
+    private boolean isDismissing = false;
+    private PermissionRequest pendingCameraLaunchPermissionRequest;
 
     // Temporary URI for storing camera capture
     public Uri tempCameraUri;
@@ -143,6 +151,8 @@ public class WebViewDialog extends Dialog {
         void handleCameraPermissionRequest(PermissionRequest request);
 
         void handleMicrophonePermissionRequest(PermissionRequest request);
+
+        void clearPendingPermissionRequest(PermissionRequest request);
     }
 
     private final PermissionHandler permissionHandler;
@@ -154,6 +164,7 @@ public class WebViewDialog extends Dialog {
         this._context = context;
         this.permissionHandler = permissionHandler;
         this.isInitialized = false;
+        this.openWebViewResolved = false;
         this.capacitorWebView = capacitorWebView;
     }
 
@@ -163,6 +174,41 @@ public class WebViewDialog extends Dialog {
 
     public String getInstanceId() {
         return instanceId;
+    }
+
+    private void resolveOpenWebViewIfNeeded() {
+        if (openWebViewResolved || _options == null) {
+            return;
+        }
+        PluginCall call = _options.getPluginCall();
+        if (call == null) {
+            Log.e("InAppBrowser", "Cannot resolve openWebView: plugin call is null");
+            openWebViewResolved = true;
+            return;
+        }
+        if (instanceId == null || instanceId.isEmpty()) {
+            call.reject("Cannot resolve openWebView: missing webview id");
+            openWebViewResolved = true;
+            return;
+        }
+        JSObject result = new JSObject();
+        result.put("id", instanceId);
+        call.resolve(result);
+        openWebViewResolved = true;
+    }
+
+    private void rejectOpenWebViewIfNeeded(String message) {
+        if (openWebViewResolved || _options == null) {
+            return;
+        }
+        PluginCall call = _options.getPluginCall();
+        if (call == null) {
+            Log.e("InAppBrowser", "Cannot reject openWebView: plugin call is null");
+            openWebViewResolved = true;
+            return;
+        }
+        call.reject(message);
+        openWebViewResolved = true;
     }
 
     // Add this class to provide safer JavaScript interface
@@ -244,6 +290,39 @@ public class WebViewDialog extends Dialog {
                 setHidden(false);
             });
         }
+
+        @JavascriptInterface
+        public void takeScreenshot(String requestId) {
+            if (requestId == null || requestId.isEmpty()) {
+                Log.e("InAppBrowser", "Cannot take screenshot - requestId is empty");
+                return;
+            }
+
+            if (_options == null || !_options.getAllowScreenshotsFromWebPage()) {
+                rejectJavaScriptScreenshot(requestId, "Screenshot bridge is not enabled for this page");
+                return;
+            }
+
+            WebViewDialog.this.takeScreenshot(
+                new ScreenshotResultCallback() {
+                    @Override
+                    public void onSuccess(JSObject screenshot) {
+                        resolveJavaScriptScreenshot(requestId, screenshot);
+                    }
+
+                    @Override
+                    public void onError(String message) {
+                        rejectJavaScriptScreenshot(requestId, message);
+                    }
+                }
+            );
+        }
+    }
+
+    public interface ScreenshotResultCallback {
+        void onSuccess(JSObject screenshot);
+
+        void onError(String message);
     }
 
     private boolean isJavaScriptControlAllowed() {
@@ -705,17 +784,29 @@ public class WebViewDialog extends Dialog {
 
                             @Override
                             public void grant(String[] resources) {
+                                pendingCameraLaunchPermissionRequest = null;
+                                if (isDismissing) {
+                                    Log.d("InAppBrowser", "Ignoring delayed camera permission grant during dismiss");
+                                    return;
+                                }
                                 // Permission granted, now launch the camera
                                 launchCameraWithPermission(useFrontCamera);
                             }
 
                             @Override
                             public void deny() {
+                                pendingCameraLaunchPermissionRequest = null;
+                                if (isDismissing) {
+                                    Log.d("InAppBrowser", "Ignoring delayed camera permission denial during dismiss");
+                                    return;
+                                }
                                 // Permission denied, fall back to file picker
                                 Log.e("InAppBrowser", "Camera permission denied, falling back to file picker");
                                 fallbackToFilePicker();
                             }
                         };
+
+                        pendingCameraLaunchPermissionRequest = tempRequest;
 
                         // Request camera permission through the plugin
                         permissionHandler.handleCameraPermissionRequest(tempRequest);
@@ -1010,10 +1101,10 @@ public class WebViewDialog extends Dialog {
                 show();
                 applyHiddenMode();
             }
-            _options.getPluginCall().resolve();
+            resolveOpenWebViewIfNeeded();
         } else if (!this._options.isPresentAfterPageLoad()) {
             show();
-            _options.getPluginCall().resolve();
+            resolveOpenWebViewIfNeeded();
         }
     }
 
@@ -1357,6 +1448,124 @@ public class WebViewDialog extends Dialog {
         }
     }
 
+    private String toJsonString(JSObject object) {
+        return object == null ? null : object.toString();
+    }
+
+    private void resolveJavaScriptScreenshot(String requestId, JSObject screenshot) {
+        if (_webView == null) {
+            return;
+        }
+        JSObject payload = new JSObject();
+        payload.put("requestId", requestId);
+        payload.put("result", screenshot);
+        String jsonPayload = toJsonString(payload);
+        if (jsonPayload == null) {
+            return;
+        }
+        String script = "window.__capgoInAppBrowserResolveScreenshot(" + jsonPayload + ");";
+        _webView.post(() -> {
+            if (_webView != null) {
+                _webView.evaluateJavascript(script, null);
+            }
+        });
+    }
+
+    private void rejectJavaScriptScreenshot(String requestId, String message) {
+        if (_webView == null) {
+            return;
+        }
+        JSObject payload = new JSObject();
+        payload.put("requestId", requestId);
+        payload.put("message", message);
+        String jsonPayload = toJsonString(payload);
+        if (jsonPayload == null) {
+            return;
+        }
+        String script = "window.__capgoInAppBrowserRejectScreenshot(" + jsonPayload + ");";
+        _webView.post(() -> {
+            if (_webView != null) {
+                _webView.evaluateJavascript(script, null);
+            }
+        });
+    }
+
+    public void takeScreenshot(ScreenshotResultCallback callback) {
+        if (_webView == null) {
+            callback.onError("WebView is not initialized");
+            return;
+        }
+
+        _webView.post(() -> {
+            if (_webView == null) {
+                callback.onError("WebView is not initialized");
+                return;
+            }
+
+            int width = _webView.getWidth() > 0 ? _webView.getWidth() : _webView.getMeasuredWidth();
+            int height = _webView.getHeight() > 0 ? _webView.getHeight() : _webView.getMeasuredHeight();
+            if (width <= 0 || height <= 0) {
+                callback.onError("WebView is not ready to capture a screenshot");
+                return;
+            }
+
+            final Bitmap bitmap;
+            try {
+                bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+            } catch (OutOfMemoryError error) {
+                callback.onError("Not enough memory to allocate screenshot buffer");
+                return;
+            }
+            Canvas canvas = new Canvas(bitmap);
+            _webView.draw(canvas);
+
+            executorService.execute(() -> {
+                try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+                    if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)) {
+                        postScreenshotError(callback, "Failed to encode screenshot");
+                        return;
+                    }
+
+                    String base64 = Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP);
+                    JSObject result = new JSObject();
+                    result.put("format", "png");
+                    result.put("mimeType", "image/png");
+                    result.put("base64", base64);
+                    result.put("dataUrl", "data:image/png;base64," + base64);
+                    result.put("width", width);
+                    result.put("height", height);
+
+                    postScreenshotSuccess(callback, result);
+                } catch (IOException e) {
+                    postScreenshotError(callback, "Failed to encode screenshot: " + e.getMessage());
+                } finally {
+                    bitmap.recycle();
+                }
+            });
+        });
+    }
+
+    private void postScreenshotSuccess(ScreenshotResultCallback callback, JSObject result) {
+        if (_webView == null) {
+            callback.onError("WebView is not initialized");
+            return;
+        }
+        _webView.post(() -> {
+            if (_options != null && _options.getCallbacks() != null) {
+                _options.getCallbacks().screenshotTaken(result);
+            }
+            callback.onSuccess(result);
+        });
+    }
+
+    private void postScreenshotError(ScreenshotResultCallback callback, String message) {
+        if (_webView == null) {
+            callback.onError(message);
+            return;
+        }
+        _webView.post(() -> callback.onError(message));
+    }
+
     private void injectJavaScriptInterface() {
         if (_webView == null) {
             Log.w("InAppBrowser", "Cannot inject JavaScript interface - WebView is null");
@@ -1384,9 +1593,48 @@ public class WebViewDialog extends Dialog {
                     """;
             }
 
+            String screenshotBridge =
+                _options != null && _options.getAllowScreenshotsFromWebPage()
+                    ? """
+                          ,
+                          takeScreenshot: function() {
+                            return new Promise(function(resolve, reject) {
+                              try {
+                                if (!nativeBridge.takeScreenshot) {
+                                  reject(new Error('Screenshot bridge is not available'));
+                                  return;
+                                }
+                                var requestId = 'screenshot_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+                                window.__capgoInAppBrowserPendingScreenshots[requestId] = { resolve: resolve, reject: reject };
+                                nativeBridge.takeScreenshot(requestId);
+                              } catch(e) {
+                                reject(e);
+                              }
+                            });
+                          }
+                      """
+                    : "";
+
             String script = String.format(
                 """
                 (function() {
+                  window.__capgoInAppBrowserPendingScreenshots = window.__capgoInAppBrowserPendingScreenshots || {};
+                  window.__capgoInAppBrowserResolveScreenshot = window.__capgoInAppBrowserResolveScreenshot || function(payload) {
+                    var pending = window.__capgoInAppBrowserPendingScreenshots[payload.requestId];
+                    if (!pending) {
+                      return;
+                    }
+                    delete window.__capgoInAppBrowserPendingScreenshots[payload.requestId];
+                    pending.resolve(payload.result);
+                  };
+                  window.__capgoInAppBrowserRejectScreenshot = window.__capgoInAppBrowserRejectScreenshot || function(payload) {
+                    var pending = window.__capgoInAppBrowserPendingScreenshots[payload.requestId];
+                    if (!pending) {
+                      return;
+                    }
+                    delete window.__capgoInAppBrowserPendingScreenshots[payload.requestId];
+                    pending.reject(new Error(payload.message));
+                  };
                   // Prefer AndroidInterface when available, otherwise fall back to native window.mobileApp
                   var nativeBridge = window.AndroidInterface || window.mobileApp;
                   if (nativeBridge) {
@@ -1406,7 +1654,7 @@ public class WebViewDialog extends Dialog {
                         } catch(e) {
                           console.error('Error in mobileApp.close:', e);
                         }
-                      }%s
+                      }%s%s
                     };
                   }
                   // Override window.print function to use our PrintInterface
@@ -1421,7 +1669,8 @@ public class WebViewDialog extends Dialog {
                   }
                 })();
                 """,
-                mobileAppExtras
+                mobileAppExtras,
+                screenshotBridge
             );
 
             _webView.post(() -> {
@@ -1883,26 +2132,35 @@ public class WebViewDialog extends Dialog {
                 public void onClick(View view) {
                     // if closeModal true then display a native modal to check if the user is sure to close the browser
                     if (_options.getCloseModal()) {
-                        new AlertDialog.Builder(_context)
-                            .setTitle(_options.getCloseModalTitle())
-                            .setMessage(_options.getCloseModalDescription())
-                            .setPositiveButton(
-                                _options.getCloseModalOk(),
-                                new OnClickListener() {
-                                    public void onClick(DialogInterface dialog, int which) {
-                                        // Close button clicked, do something
-                                        String currentUrl = getUrl();
-                                        dismiss();
-                                        if (_options != null && _options.getCallbacks() != null) {
-                                            // Notify that confirm was clicked
-                                            _options.getCallbacks().confirmBtnClicked(currentUrl);
-                                            _options.getCallbacks().closeEvent(currentUrl);
+                        Pattern urlPattern = _options.getCloseModalURLPattern();
+                        final String currentUrl = getUrl();
+                        boolean shouldShowModal = urlPattern == null || urlPattern.matcher(currentUrl).find();
+                        if (shouldShowModal) {
+                            new AlertDialog.Builder(_context)
+                                .setTitle(_options.getCloseModalTitle())
+                                .setMessage(_options.getCloseModalDescription())
+                                .setPositiveButton(
+                                    _options.getCloseModalOk(),
+                                    new OnClickListener() {
+                                        public void onClick(DialogInterface dialog, int which) {
+                                            // Close button clicked, do something
+                                            dismiss();
+                                            if (_options != null && _options.getCallbacks() != null) {
+                                                // Notify that confirm was clicked
+                                                _options.getCallbacks().confirmBtnClicked(currentUrl);
+                                                _options.getCallbacks().closeEvent(currentUrl);
+                                            }
                                         }
                                     }
-                                }
-                            )
-                            .setNegativeButton(_options.getCloseModalCancel(), null)
-                            .show();
+                                )
+                                .setNegativeButton(_options.getCloseModalCancel(), null)
+                                .show();
+                        } else {
+                            dismiss();
+                            if (_options != null && _options.getCallbacks() != null) {
+                                _options.getCallbacks().closeEvent(currentUrl);
+                            }
+                        }
                     } else {
                         String currentUrl = getUrl();
                         dismiss();
@@ -2021,118 +2279,119 @@ public class WebViewDialog extends Dialog {
             // Status bar color is already set at the top of this method, no need to set again
 
             Options.ButtonNearDone buttonNearDone = _options.getButtonNearDone();
-            if (buttonNearDone != null) {
+            if (buttonNearDone != null || _options.getShowScreenshotButton()) {
                 ImageButton buttonNearDoneView = _toolbar.findViewById(R.id.buttonNearDone);
                 buttonNearDoneView.setVisibility(View.VISIBLE);
 
-                // Handle different icon types
-                String iconType = buttonNearDone.getIconType();
-                if ("vector".equals(iconType)) {
-                    // Use native Android vector drawable
-                    try {
-                        String iconName = buttonNearDone.getIcon();
-                        // Convert name to Android resource ID (remove file extension if present)
-                        if (iconName.endsWith(".xml")) {
-                            iconName = iconName.substring(0, iconName.length() - 4);
-                        }
+                if (_options.getShowScreenshotButton()) {
+                    buttonNearDoneView.setImageResource(android.R.drawable.ic_menu_camera);
+                    buttonNearDoneView.setColorFilter(iconColor);
+                    buttonNearDoneView.setOnClickListener((view) ->
+                        takeScreenshot(
+                            new ScreenshotResultCallback() {
+                                @Override
+                                public void onSuccess(JSObject screenshot) {}
 
-                        // Get resource ID
-                        int resourceId = _context.getResources().getIdentifier(iconName, "drawable", _context.getPackageName());
+                                @Override
+                                public void onError(String message) {
+                                    Log.e("InAppBrowser", "Failed to capture screenshot from toolbar: " + message);
+                                }
+                            }
+                        )
+                    );
+                } else {
+                    // Handle different icon types
+                    String iconType = buttonNearDone.getIconType();
+                    if ("vector".equals(iconType)) {
+                        // Use native Android vector drawable
+                        try {
+                            String iconName = buttonNearDone.getIcon();
+                            if (iconName.endsWith(".xml")) {
+                                iconName = iconName.substring(0, iconName.length() - 4);
+                            }
 
-                        if (resourceId != 0) {
-                            // Set the vector drawable
-                            buttonNearDoneView.setImageResource(resourceId);
-                            // Apply color filter
-                            buttonNearDoneView.setColorFilter(iconColor);
-                            Log.d("InAppBrowser", "Successfully loaded vector drawable: " + iconName);
-                        } else {
-                            Log.e("InAppBrowser", "Vector drawable not found: " + iconName + ", using fallback");
-                            // Fallback to a common system icon
+                            int resourceId = _context.getResources().getIdentifier(iconName, "drawable", _context.getPackageName());
+
+                            if (resourceId != 0) {
+                                buttonNearDoneView.setImageResource(resourceId);
+                                buttonNearDoneView.setColorFilter(iconColor);
+                                Log.d("InAppBrowser", "Successfully loaded vector drawable: " + iconName);
+                            } else {
+                                Log.e("InAppBrowser", "Vector drawable not found: " + iconName + ", using fallback");
+                                buttonNearDoneView.setImageResource(android.R.drawable.ic_menu_info_details);
+                                buttonNearDoneView.setColorFilter(iconColor);
+                            }
+                        } catch (Exception e) {
+                            Log.e("InAppBrowser", "Error loading vector drawable: " + e.getMessage());
                             buttonNearDoneView.setImageResource(android.R.drawable.ic_menu_info_details);
                             buttonNearDoneView.setColorFilter(iconColor);
                         }
-                    } catch (Exception e) {
-                        Log.e("InAppBrowser", "Error loading vector drawable: " + e.getMessage());
-                        // Fallback to a common system icon
-                        buttonNearDoneView.setImageResource(android.R.drawable.ic_menu_info_details);
-                        buttonNearDoneView.setColorFilter(iconColor);
-                    }
-                } else if ("asset".equals(iconType)) {
-                    // Handle SVG from assets
-                    AssetManager assetManager = _context.getAssets();
-                    InputStream inputStream = null;
-                    try {
-                        // Try to load from public folder first
-                        String iconPath = "public/" + buttonNearDone.getIcon();
+                    } else if ("asset".equals(iconType)) {
+                        // Handle SVG from assets
+                        AssetManager assetManager = _context.getAssets();
+                        InputStream inputStream = null;
                         try {
-                            inputStream = assetManager.open(iconPath);
-                        } catch (IOException e) {
-                            // If not found in public, try root assets
+                            String iconPath = "public/" + buttonNearDone.getIcon();
                             try {
-                                inputStream = assetManager.open(buttonNearDone.getIcon());
-                            } catch (IOException e2) {
-                                Log.e("InAppBrowser", "SVG file not found in assets: " + buttonNearDone.getIcon());
+                                inputStream = assetManager.open(iconPath);
+                            } catch (IOException e) {
+                                try {
+                                    inputStream = assetManager.open(buttonNearDone.getIcon());
+                                } catch (IOException e2) {
+                                    Log.e("InAppBrowser", "SVG file not found in assets: " + buttonNearDone.getIcon());
+                                    buttonNearDoneView.setVisibility(View.GONE);
+                                    return;
+                                }
+                            }
+
+                            SVG svg = SVG.getFromInputStream(inputStream);
+                            if (svg == null) {
+                                Log.e("InAppBrowser", "Failed to parse SVG icon: " + buttonNearDone.getIcon());
                                 buttonNearDoneView.setVisibility(View.GONE);
                                 return;
                             }
-                        }
 
-                        // Parse and render SVG
-                        SVG svg = SVG.getFromInputStream(inputStream);
-                        if (svg == null) {
-                            Log.e("InAppBrowser", "Failed to parse SVG icon: " + buttonNearDone.getIcon());
+                            float width = buttonNearDone.getWidth() > 0 ? buttonNearDone.getWidth() : 24;
+                            float height = buttonNearDone.getHeight() > 0 ? buttonNearDone.getHeight() : 24;
+                            float density = _context.getResources().getDisplayMetrics().density;
+                            int targetWidth = Math.round(width * density);
+                            int targetHeight = Math.round(height * density);
+
+                            svg.setDocumentWidth(targetWidth);
+                            svg.setDocumentHeight(targetHeight);
+
+                            Bitmap bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888);
+                            Canvas canvas = new Canvas(bitmap);
+                            svg.renderToCanvas(canvas);
+
+                            Paint paint = new Paint();
+                            paint.setColorFilter(new PorterDuffColorFilter(iconColor, PorterDuff.Mode.SRC_IN));
+                            Canvas colorFilterCanvas = new Canvas(bitmap);
+                            colorFilterCanvas.drawBitmap(bitmap, 0, 0, paint);
+
+                            buttonNearDoneView.setImageBitmap(bitmap);
+                            buttonNearDoneView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                            buttonNearDoneView.setPadding(12, 12, 12, 12);
+                        } catch (SVGParseException e) {
+                            Log.e("InAppBrowser", "Error loading SVG icon: " + e.getMessage(), e);
                             buttonNearDoneView.setVisibility(View.GONE);
-                            return;
-                        }
-
-                        // Get the dimensions from options or use SVG's size
-                        float width = buttonNearDone.getWidth() > 0 ? buttonNearDone.getWidth() : 24;
-                        float height = buttonNearDone.getHeight() > 0 ? buttonNearDone.getHeight() : 24;
-
-                        // Get density for proper scaling
-                        float density = _context.getResources().getDisplayMetrics().density;
-                        int targetWidth = Math.round(width * density);
-                        int targetHeight = Math.round(height * density);
-
-                        // Set document size
-                        svg.setDocumentWidth(targetWidth);
-                        svg.setDocumentHeight(targetHeight);
-
-                        // Create a bitmap and render SVG to it for better quality
-                        Bitmap bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888);
-                        Canvas canvas = new Canvas(bitmap);
-                        svg.renderToCanvas(canvas);
-
-                        // Apply color filter to the bitmap
-                        Paint paint = new Paint();
-                        paint.setColorFilter(new PorterDuffColorFilter(iconColor, PorterDuff.Mode.SRC_IN));
-                        Canvas colorFilterCanvas = new Canvas(bitmap);
-                        colorFilterCanvas.drawBitmap(bitmap, 0, 0, paint);
-
-                        // Set the colored bitmap as image
-                        buttonNearDoneView.setImageBitmap(bitmap);
-                        buttonNearDoneView.setScaleType(ImageView.ScaleType.FIT_CENTER);
-                        buttonNearDoneView.setPadding(12, 12, 12, 12); // Standard button padding
-                    } catch (SVGParseException e) {
-                        Log.e("InAppBrowser", "Error loading SVG icon: " + e.getMessage(), e);
-                        buttonNearDoneView.setVisibility(View.GONE);
-                    } finally {
-                        if (inputStream != null) {
-                            try {
-                                inputStream.close();
-                            } catch (IOException e) {
-                                Log.e("InAppBrowser", "Error closing input stream: " + e.getMessage());
+                        } finally {
+                            if (inputStream != null) {
+                                try {
+                                    inputStream.close();
+                                } catch (IOException e) {
+                                    Log.e("InAppBrowser", "Error closing input stream: " + e.getMessage());
+                                }
                             }
                         }
+                    } else {
+                        // Default fallback or unsupported type
+                        Log.e("InAppBrowser", "Unsupported icon type: " + iconType);
+                        buttonNearDoneView.setVisibility(View.GONE);
                     }
-                } else {
-                    // Default fallback or unsupported type
-                    Log.e("InAppBrowser", "Unsupported icon type: " + iconType);
-                    buttonNearDoneView.setVisibility(View.GONE);
-                }
 
-                // Set the click listener
-                buttonNearDoneView.setOnClickListener((view) -> _options.getCallbacks().buttonNearDoneClicked());
+                    buttonNearDoneView.setOnClickListener((view) -> _options.getCallbacks().buttonNearDoneClicked());
+                }
             } else {
                 ImageButton buttonNearDoneView = _toolbar.findViewById(R.id.buttonNearDone);
                 buttonNearDoneView.setVisibility(View.GONE);
@@ -2480,7 +2739,7 @@ public class WebViewDialog extends Dialog {
                     if (isNotHttpOrHttps) {
                         try {
                             Intent intent;
-                            if (url.startsWith("intent://")) {
+                            if (url.startsWith("intent:")) {
                                 intent = Intent.parseUri(url, Intent.URI_INTENT_SCHEME);
                             } else {
                                 intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
@@ -2493,6 +2752,7 @@ public class WebViewDialog extends Dialog {
                             // Notify that a page load error occurred
                             if (_options.getCallbacks() != null && request.isForMainFrame()) {
                                 _options.getCallbacks().pageLoadError();
+                                rejectOpenWebViewIfNeeded("No handler available for external URL: " + url);
                             }
                             return true; // prevent WebView from attempting to load the custom scheme
                         }
@@ -2822,7 +3082,7 @@ public class WebViewDialog extends Dialog {
                             boolean usePreShowScript = _options.getPreShowScript() != null && !_options.getPreShowScript().isEmpty();
                             if (!usePreShowScript) {
                                 show();
-                                _options.getPluginCall().resolve();
+                                resolveOpenWebViewIfNeeded();
                             } else {
                                 executorService.execute(
                                     new Runnable() {
@@ -2837,7 +3097,7 @@ public class WebViewDialog extends Dialog {
                                                     @Override
                                                     public void run() {
                                                         show();
-                                                        _options.getPluginCall().resolve();
+                                                        resolveOpenWebViewIfNeeded();
                                                     }
                                                 }
                                             );
@@ -2915,6 +3175,11 @@ public class WebViewDialog extends Dialog {
                         return;
                     }
                     _options.getCallbacks().pageLoadError();
+                    if (request != null && request.isForMainFrame() && !isInitialized) {
+                        CharSequence description = error != null ? error.getDescription() : null;
+                        String message = description != null ? "Initial page load failed: " + description : "Initial page load failed";
+                        rejectOpenWebViewIfNeeded(message);
+                    }
                 }
 
                 @SuppressLint("WebViewClientOnReceivedSslError")
@@ -3041,8 +3306,26 @@ public class WebViewDialog extends Dialog {
         // First, stop any ongoing operations and disable further interactions
         if (_webView != null) {
             try {
+                isDismissing = true;
+
                 // Stop loading first to prevent any ongoing operations
                 _webView.stopLoading();
+
+                if (pendingCameraLaunchPermissionRequest != null) {
+                    permissionHandler.clearPendingPermissionRequest(pendingCameraLaunchPermissionRequest);
+                    pendingCameraLaunchPermissionRequest = null;
+                }
+
+                if (currentPermissionRequest != null) {
+                    try {
+                        permissionHandler.clearPendingPermissionRequest(currentPermissionRequest);
+                        currentPermissionRequest.deny();
+                    } catch (Exception e) {
+                        Log.w("InAppBrowser", "Could not deny pending media permission request: " + e.getMessage());
+                    } finally {
+                        currentPermissionRequest = null;
+                    }
+                }
 
                 // Clear any pending callbacks to prevent memory leaks
                 if (mFilePathCallback != null) {
@@ -3072,20 +3355,55 @@ public class WebViewDialog extends Dialog {
                     Log.w("InAppBrowser", "Could not clear file inputs (WebView may be in invalid state): " + e.getMessage());
                 }
 
+                forceStopMediaCapture(_webView);
+
                 // Remove JavaScript interfaces before destroying
                 _webView.removeJavascriptInterface("AndroidInterface");
                 _webView.removeJavascriptInterface("PreShowScriptInterface");
                 _webView.removeJavascriptInterface("PrintInterface");
 
-                // Load blank page and cleanup
-                _webView.loadUrl("about:blank");
-                _webView.onPause();
                 _webView.removeAllViews();
-                _webView.destroy();
+
+                final WebView webViewToDestroy = _webView;
                 _webView = null;
+                final Handler mainHandler = new Handler(Looper.getMainLooper());
+                final AtomicBoolean destroyCalled = new AtomicBoolean(false);
+
+                final Runnable doDestroy = () -> {
+                    if (!destroyCalled.getAndSet(true)) {
+                        try {
+                            webViewToDestroy.onPause();
+                            webViewToDestroy.destroy();
+                        } catch (Exception e) {
+                            Log.e("InAppBrowser", "Error destroying WebView: " + e.getMessage());
+                        }
+                    }
+                };
+
+                // Schedule the fallback before the navigation handoff so destroy still
+                // runs if setWebViewClient/loadUrl throws.
+                mainHandler.postDelayed(doDestroy, 3000);
+
+                // Let Chromium finish unloading the page before pausing and destroying
+                // the renderer so active media capture can be released cleanly.
+                try {
+                    webViewToDestroy.setWebViewClient(
+                        new WebViewClient() {
+                            @Override
+                            public void onPageFinished(WebView view, String url) {
+                                if ("about:blank".equals(url)) {
+                                    mainHandler.postDelayed(doDestroy, 200);
+                                }
+                            }
+                        }
+                    );
+                    webViewToDestroy.loadUrl("about:blank");
+                } catch (Exception e) {
+                    Log.e("InAppBrowser", "Falling back to immediate WebView destroy: " + e.getMessage());
+                    doDestroy.run();
+                }
             } catch (Exception e) {
                 Log.e("InAppBrowser", "Error during WebView cleanup: " + e.getMessage());
-                // Force set to null even if cleanup failed
                 _webView = null;
             }
         }
@@ -3102,6 +3420,60 @@ public class WebViewDialog extends Dialog {
             super.dismiss();
         } catch (Exception e) {
             Log.e("InAppBrowser", "Error dismissing dialog: " + e.getMessage());
+        }
+    }
+
+    private void forceStopMediaCapture(WebView webView) {
+        try {
+            String stopMediaCaptureScript = """
+                (function() {
+                  var stoppedTracks = 0;
+                  function stopStream(value) {
+                    try {
+                      if (!value || typeof value.getTracks !== 'function') {
+                        return;
+                      }
+                      var tracks = value.getTracks();
+                      for (var i = 0; i < tracks.length; i++) {
+                        try {
+                          tracks[i].stop();
+                          stoppedTracks++;
+                        } catch (e) {}
+                      }
+                    } catch (e) {}
+                  }
+
+                  try {
+                    var mediaElements = document.querySelectorAll('audio,video');
+                    for (var i = 0; i < mediaElements.length; i++) {
+                      var element = mediaElements[i];
+                      try { stopStream(element.srcObject); } catch (e) {}
+                      try { element.pause(); } catch (e) {}
+                      try { element.srcObject = null; } catch (e) {}
+                    }
+                  } catch (e) {}
+
+                  try {
+                    var windowKeys = Object.keys(window);
+                    for (var j = 0; j < windowKeys.length; j++) {
+                      var value = window[windowKeys[j]];
+                      stopStream(value);
+                      if (Array.isArray(value)) {
+                        for (var k = 0; k < value.length; k++) {
+                          stopStream(value[k]);
+                        }
+                      }
+                    }
+                  } catch (e) {}
+
+                  return stoppedTracks;
+                })();
+                """;
+            webView.evaluateJavascript(stopMediaCaptureScript, (result) ->
+                Log.d("InAppBrowser", "Stopped active media tracks before dismiss: " + result)
+            );
+        } catch (Exception e) {
+            Log.w("InAppBrowser", "Could not force-stop media capture before dismiss: " + e.getMessage());
         }
     }
 
@@ -3347,6 +3719,22 @@ public class WebViewDialog extends Dialog {
 
         // Apply new dimensions
         applyDimensions();
+    }
+
+    public void setEnabledSafeTopMargin(boolean enabled) {
+        if (_options.getEnabledSafeTopMargin() == enabled) return;
+        _options.setEnabledSafeTopMargin(enabled);
+        if (_webView != null) {
+            ViewCompat.requestApplyInsets(_webView);
+        }
+    }
+
+    public void setEnabledSafeBottomMargin(boolean enabled) {
+        if (_options.getEnabledSafeMargin() == enabled) return;
+        _options.setEnabledSafeMargin(enabled);
+        if (_webView != null) {
+            ViewCompat.requestApplyInsets(_webView);
+        }
     }
 
     /**

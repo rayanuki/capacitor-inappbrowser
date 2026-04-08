@@ -53,61 +53,73 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
         super.init(coder: aDecoder)
     }
 
-    public init(source: WKWebSource?, credentials: WKWebViewCredentials? = nil) {
+    public init(source: WKWebSource?, credentials: WKWebViewCredentials? = nil, allowWebViewJsVisibilityControl: Bool = false, allowScreenshotsFromWebPage: Bool = false) {
         super.init(nibName: nil, bundle: nil)
         self.source = source
         self.credentials = credentials
+        self.allowWebViewJsVisibilityControl = allowWebViewJsVisibilityControl
+        self.allowScreenshotsFromWebPage = allowScreenshotsFromWebPage
         self.initWebview()
     }
 
-    public init(url: URL, credentials: WKWebViewCredentials? = nil) {
+    public init(url: URL, credentials: WKWebViewCredentials? = nil, allowWebViewJsVisibilityControl: Bool = false, allowScreenshotsFromWebPage: Bool = false) {
         super.init(nibName: nil, bundle: nil)
         self.source = .remote(url)
         self.credentials = credentials
+        self.allowWebViewJsVisibilityControl = allowWebViewJsVisibilityControl
+        self.allowScreenshotsFromWebPage = allowScreenshotsFromWebPage
         self.initWebview()
     }
 
-    public init(url: URL, headers: [String: String], isInspectable: Bool, credentials: WKWebViewCredentials? = nil, preventDeeplink: Bool) {
+    public init(url: URL, headers: [String: String], isInspectable: Bool, credentials: WKWebViewCredentials? = nil, preventDeeplink: Bool, allowWebViewJsVisibilityControl: Bool = false, allowScreenshotsFromWebPage: Bool = false) {
         super.init(nibName: nil, bundle: nil)
         self.source = .remote(url)
         self.credentials = credentials
+        self.allowWebViewJsVisibilityControl = allowWebViewJsVisibilityControl
+        self.allowScreenshotsFromWebPage = allowScreenshotsFromWebPage
         self.setHeaders(headers: headers)
         self.setPreventDeeplink(preventDeeplink: preventDeeplink)
         self.initWebview(isInspectable: isInspectable)
     }
 
-    public init(url: URL, headers: [String: String], isInspectable: Bool, credentials: WKWebViewCredentials? = nil, preventDeeplink: Bool, blankNavigationTab: Bool, enabledSafeBottomMargin: Bool, enabledSafeTopMargin: Bool = true) {
+    public init(url: URL, headers: [String: String], isInspectable: Bool, credentials: WKWebViewCredentials? = nil, preventDeeplink: Bool, blankNavigationTab: Bool, enabledSafeBottomMargin: Bool, enabledSafeTopMargin: Bool = true, allowWebViewJsVisibilityControl: Bool = false, allowScreenshotsFromWebPage: Bool = false) {
         super.init(nibName: nil, bundle: nil)
         self.blankNavigationTab = blankNavigationTab
         self.enabledSafeBottomMargin = enabledSafeBottomMargin
         self.enabledSafeTopMargin = enabledSafeTopMargin
         self.source = .remote(url)
         self.credentials = credentials
+        self.allowWebViewJsVisibilityControl = allowWebViewJsVisibilityControl
+        self.allowScreenshotsFromWebPage = allowScreenshotsFromWebPage
         self.setHeaders(headers: headers)
         self.setPreventDeeplink(preventDeeplink: preventDeeplink)
         self.initWebview(isInspectable: isInspectable)
     }
 
-    public init(url: URL, headers: [String: String], isInspectable: Bool, credentials: WKWebViewCredentials? = nil, preventDeeplink: Bool, blankNavigationTab: Bool, enabledSafeBottomMargin: Bool, enabledSafeTopMargin: Bool = true, blockedHosts: [String]) {
+    public init(url: URL, headers: [String: String], isInspectable: Bool, credentials: WKWebViewCredentials? = nil, preventDeeplink: Bool, blankNavigationTab: Bool, enabledSafeBottomMargin: Bool, enabledSafeTopMargin: Bool = true, blockedHosts: [String], allowWebViewJsVisibilityControl: Bool = false, allowScreenshotsFromWebPage: Bool = false) {
         super.init(nibName: nil, bundle: nil)
         self.blankNavigationTab = blankNavigationTab
         self.enabledSafeBottomMargin = enabledSafeBottomMargin
         self.enabledSafeTopMargin = enabledSafeTopMargin
         self.source = .remote(url)
         self.credentials = credentials
+        self.allowWebViewJsVisibilityControl = allowWebViewJsVisibilityControl
+        self.allowScreenshotsFromWebPage = allowScreenshotsFromWebPage
         self.setHeaders(headers: headers)
         self.setPreventDeeplink(preventDeeplink: preventDeeplink)
         self.setBlockedHosts(blockedHosts: blockedHosts)
         self.initWebview(isInspectable: isInspectable)
     }
 
-    public init(url: URL, headers: [String: String], isInspectable: Bool, credentials: WKWebViewCredentials? = nil, preventDeeplink: Bool, blankNavigationTab: Bool, enabledSafeBottomMargin: Bool, enabledSafeTopMargin: Bool = true, blockedHosts: [String], authorizedAppLinks: [String]) {
+    public init(url: URL, headers: [String: String], isInspectable: Bool, credentials: WKWebViewCredentials? = nil, preventDeeplink: Bool, blankNavigationTab: Bool, enabledSafeBottomMargin: Bool, enabledSafeTopMargin: Bool = true, blockedHosts: [String], authorizedAppLinks: [String], allowWebViewJsVisibilityControl: Bool = false, allowScreenshotsFromWebPage: Bool = false) {
         super.init(nibName: nil, bundle: nil)
         self.blankNavigationTab = blankNavigationTab
         self.enabledSafeBottomMargin = enabledSafeBottomMargin
         self.enabledSafeTopMargin = enabledSafeTopMargin
         self.source = .remote(url)
         self.credentials = credentials
+        self.allowWebViewJsVisibilityControl = allowWebViewJsVisibilityControl
+        self.allowScreenshotsFromWebPage = allowScreenshotsFromWebPage
         self.setHeaders(headers: headers)
         self.setPreventDeeplink(preventDeeplink: preventDeeplink)
         self.setBlockedHosts(blockedHosts: blockedHosts)
@@ -122,6 +134,7 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
     open var tintColor: UIColor?
     open var allowsFileURL = true
     open var allowWebViewJsVisibilityControl = false
+    open var allowScreenshotsFromWebPage = false
     open var delegate: WKWebViewControllerDelegate?
     open var bypassedSSLHosts: [String]?
     open var cookies: [HTTPCookie]?
@@ -141,6 +154,12 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
     open var closeModalDescription = ""
     open var closeModalOk = ""
     open var closeModalCancel = ""
+    open var closeModalURLPattern = "" {
+        didSet {
+            closeModalURLRegex = closeModalURLPattern.isEmpty ? nil : (try? NSRegularExpression(pattern: closeModalURLPattern))
+        }
+    }
+    private var closeModalURLRegex: NSRegularExpression?
     open var ignoreUntrustedSSLError = false
     open var enableGooglePaySupport = false
     var viewWasPresented = false
@@ -287,6 +306,7 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
     open var activityBarButtonItemImage: UIImage?
 
     open var buttonNearDoneIcon: UIImage?
+    open var showScreenshotButton = false
 
     fileprivate var webView: WKWebView?
     fileprivate var progressView: UIProgressView?
@@ -538,6 +558,79 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
         capBrowserPlugin?.notifyListeners(eventName, data: payload(with: data))
     }
 
+    private func jsonString(from object: Any) -> String? {
+        guard JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object),
+              let string = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return string
+    }
+
+    private func resolveJavaScriptScreenshot(requestId: String, result: [String: Any]) {
+        guard let payload = jsonString(from: ["requestId": requestId, "result": result]) else {
+            return
+        }
+        let script = "window.__capgoInAppBrowserResolveScreenshot(\(payload));"
+        DispatchQueue.main.async {
+            self.webView?.evaluateJavaScript(script, completionHandler: nil)
+        }
+    }
+
+    private func rejectJavaScriptScreenshot(requestId: String, message: String) {
+        guard let payload = jsonString(from: ["requestId": requestId, "message": message]) else {
+            return
+        }
+        let script = "window.__capgoInAppBrowserRejectScreenshot(\(payload));"
+        DispatchQueue.main.async {
+            self.webView?.evaluateJavaScript(script, completionHandler: nil)
+        }
+    }
+
+    func takeScreenshot(completion: @escaping (Result<[String: Any], Error>) -> Void) {
+        DispatchQueue.main.async {
+            guard let webView = self.webView else {
+                completion(.failure(NSError(domain: "InAppBrowser", code: 1, userInfo: [NSLocalizedDescriptionKey: "WebView is not initialized"])))
+                return
+            }
+
+            let targetSize = webView.bounds.size
+            guard targetSize.width > 0, targetSize.height > 0 else {
+                completion(.failure(NSError(domain: "InAppBrowser", code: 2, userInfo: [NSLocalizedDescriptionKey: "WebView is not ready to capture a screenshot"])))
+                return
+            }
+
+            let configuration = WKSnapshotConfiguration()
+            configuration.rect = webView.bounds
+            configuration.afterScreenUpdates = false
+
+            webView.takeSnapshot(with: configuration) { image, error in
+                if let error {
+                    completion(.failure(error))
+                    return
+                }
+
+                guard let image,
+                      let imageData = image.pngData() else {
+                    completion(.failure(NSError(domain: "InAppBrowser", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to encode screenshot"])))
+                    return
+                }
+
+                let base64 = imageData.base64EncodedString()
+                let result: [String: Any] = [
+                    "format": "png",
+                    "mimeType": "image/png",
+                    "base64": base64,
+                    "dataUrl": "data:image/png;base64,\(base64)",
+                    "width": Int(image.size.width * image.scale),
+                    "height": Int(image.size.height * image.scale)
+                ]
+                self.emit("screenshotTaken", data: result)
+                completion(.success(result))
+            }
+        }
+    }
+
     // Method to receive messages from JavaScript
     public func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         if message.name == "messageHandler" {
@@ -574,6 +667,26 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
                 return
             }
             capBrowserPlugin?.setHiddenFromJavaScript(false)
+        } else if message.name == "takeScreenshot" {
+            guard let body = message.body as? [String: Any],
+                  let requestId = body["requestId"] as? String,
+                  !requestId.isEmpty else {
+                return
+            }
+
+            guard allowScreenshotsFromWebPage else {
+                self.rejectJavaScriptScreenshot(requestId: requestId, message: "Screenshot bridge is not enabled for this page")
+                return
+            }
+
+            takeScreenshot { result in
+                switch result {
+                case .success(let screenshot):
+                    self.resolveJavaScriptScreenshot(requestId: requestId, result: screenshot)
+                case .failure(let error):
+                    self.rejectJavaScriptScreenshot(requestId: requestId, message: error.localizedDescription)
+                }
+            }
         } else if message.name == "magicPrint" {
             if let webView = self.webView {
                 let printController = UIPrintInteractionController.shared
@@ -590,7 +703,21 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
         }
     }
 
-    func injectJavaScriptInterface() {
+    private func mobileAppScriptSource() -> String {
+        let screenshotControls = allowScreenshotsFromWebPage ? """
+                                ,
+                                takeScreenshot: function() {
+                                        return new Promise(function(resolve, reject) {
+                                                if (!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.takeScreenshot)) {
+                                                        reject(new Error('Screenshot bridge is not available'));
+                                                        return;
+                                                }
+                                                var requestId = 'screenshot_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+                                                window.__capgoInAppBrowserPendingScreenshots[requestId] = { resolve: resolve, reject: reject };
+                                                window.webkit.messageHandlers.takeScreenshot.postMessage({ requestId: requestId });
+                                        });
+                                }
+                """ : ""
         let extraControls = allowWebViewJsVisibilityControl ? """
                                 ,
                                 hide: function() {
@@ -600,20 +727,48 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
                                         window.webkit.messageHandlers.show.postMessage(null);
                                 }
                 """ : ""
-        let script = """
-                if (!window.mobileApp) {
-                        window.mobileApp = {
-                                postMessage: function(message) {
-                                        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.messageHandler) {
-                                                window.webkit.messageHandlers.messageHandler.postMessage(message);
-                                        }
-                                },
-                                close: function() {
-                                        window.webkit.messageHandlers.close.postMessage(null);
-                                }\(extraControls)
-                        };
-                }
+        return """
+                window.__capgoInAppBrowserPendingScreenshots = window.__capgoInAppBrowserPendingScreenshots || {};
+                window.__capgoInAppBrowserResolveScreenshot = window.__capgoInAppBrowserResolveScreenshot || function(payload) {
+                        var pending = window.__capgoInAppBrowserPendingScreenshots[payload.requestId];
+                        if (!pending) {
+                                return;
+                        }
+                        delete window.__capgoInAppBrowserPendingScreenshots[payload.requestId];
+                        pending.resolve(payload.result);
+                };
+                window.__capgoInAppBrowserRejectScreenshot = window.__capgoInAppBrowserRejectScreenshot || function(payload) {
+                        var pending = window.__capgoInAppBrowserPendingScreenshots[payload.requestId];
+                        if (!pending) {
+                                return;
+                        }
+                        delete window.__capgoInAppBrowserPendingScreenshots[payload.requestId];
+                        pending.reject(new Error(payload.message));
+                };
+                window.mobileApp = Object.assign({}, window.mobileApp || {}, {
+                        postMessage: function(message) {
+                                if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.messageHandler) {
+                                        window.webkit.messageHandlers.messageHandler.postMessage(message);
+                                }
+                        },
+                        close: function() {
+                                window.webkit.messageHandlers.close.postMessage(null);
+                        }\(extraControls)\(screenshotControls)
+                });
                 """
+    }
+
+    private func addMobileAppUserScript(to userContentController: WKUserContentController) {
+        let script = WKUserScript(
+            source: mobileAppScriptSource(),
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        )
+        userContentController.addUserScript(script)
+    }
+
+    func injectJavaScriptInterface() {
+        let script = mobileAppScriptSource()
         DispatchQueue.main.async {
             self.webView?.evaluateJavaScript(script) { result, error in
                 if let error = error {
@@ -647,6 +802,9 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
         userContentController.add(weakHandler, name: "close")
         userContentController.add(weakHandler, name: "hide")
         userContentController.add(weakHandler, name: "show")
+        if allowScreenshotsFromWebPage {
+            userContentController.add(weakHandler, name: "takeScreenshot")
+        }
         userContentController.add(weakHandler, name: "magicPrint")
 
         // Inject JavaScript to override window.print
@@ -660,6 +818,7 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
             forMainFrameOnly: false
         )
         userContentController.addUserScript(script)
+        addMobileAppUserScript(to: userContentController)
 
         webConfiguration.allowsInlineMediaPlayback = true
         webConfiguration.userContentController = userContentController
@@ -1064,6 +1223,9 @@ public extension WKWebViewController {
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "close")
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "hide")
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "show")
+        if allowScreenshotsFromWebPage {
+            webView.configuration.userContentController.removeScriptMessageHandler(forName: "takeScreenshot")
+        }
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "preShowScriptSuccess")
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "preShowScriptError")
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "magicPrint")
@@ -1473,6 +1635,14 @@ fileprivate extension WKWebViewController {
     }
 
     @objc func buttonNearDoneDidClick(sender: AnyObject) {
+        if showScreenshotButton {
+            takeScreenshot { result in
+                if case .failure(let error) = result {
+                    print("[InAppBrowser] Failed to capture screenshot from toolbar button: \(error.localizedDescription)")
+                }
+            }
+            return
+        }
         emit("buttonNearDoneClick")
     }
 
@@ -1574,14 +1744,23 @@ fileprivate extension WKWebViewController {
         // check if closeModal is true, if true display alert before close
         if self.closeModal {
             let currentUrl = webView?.url?.absoluteString ?? ""
-            let alert = UIAlertController(title: self.closeModalTitle, message: self.closeModalDescription, preferredStyle: UIAlertController.Style.alert)
-            alert.addAction(UIAlertAction(title: self.closeModalOk, style: UIAlertAction.Style.default, handler: { _ in
-                // Notify that confirm was clicked
-                self.emit("confirmBtnClicked", data: ["url": currentUrl])
+            var shouldShowModal = true
+            if let regex = self.closeModalURLRegex {
+                let matched = regex.firstMatch(in: currentUrl, range: NSRange(currentUrl.startIndex..., in: currentUrl)) != nil
+                shouldShowModal = matched
+            }
+            if shouldShowModal {
+                let alert = UIAlertController(title: self.closeModalTitle, message: self.closeModalDescription, preferredStyle: UIAlertController.Style.alert)
+                alert.addAction(UIAlertAction(title: self.closeModalOk, style: UIAlertAction.Style.default, handler: { _ in
+                    // Notify that confirm was clicked
+                    self.emit("confirmBtnClicked", data: ["url": currentUrl])
+                    self.closeView()
+                }))
+                alert.addAction(UIAlertAction(title: self.closeModalCancel, style: UIAlertAction.Style.default, handler: nil))
+                self.present(alert, animated: true, completion: nil)
+            } else {
                 self.closeView()
-            }))
-            alert.addAction(UIAlertAction(title: self.closeModalCancel, style: UIAlertAction.Style.default, handler: nil))
-            self.present(alert, animated: true, completion: nil)
+            }
         } else {
             self.closeView()
         }
@@ -2033,6 +2212,46 @@ extension WKWebViewController: WKNavigationDelegate {
 
         // Apply the new dimensions
         applyCustomDimensions()
+    }
+
+    open func updateSafeTopMargin(_ enabled: Bool) {
+        guard enabled != self.enabledSafeTopMargin else { return }
+        self.enabledSafeTopMargin = enabled
+        guard let webView = self.webView else { return }
+        guard webView.superview === self.view else { return }
+
+        // Find and deactivate the existing top constraint
+        let existingTopConstraints = self.view.constraints.filter {
+            ($0.firstItem as? WKWebView) == webView && $0.firstAttribute == .top
+        }
+        NSLayoutConstraint.deactivate(existingTopConstraints)
+
+        // Create new top constraint based on enabled value
+        let topAnchor = enabled ? self.view.safeAreaLayoutGuide.topAnchor : self.view.topAnchor
+        NSLayoutConstraint.activate([
+            webView.topAnchor.constraint(equalTo: topAnchor)
+        ])
+        self.view.layoutIfNeeded()
+    }
+
+    open func updateSafeBottomMargin(_ enabled: Bool) {
+        guard enabled != self.enabledSafeBottomMargin else { return }
+        self.enabledSafeBottomMargin = enabled
+        guard let webView = self.webView else { return }
+        guard webView.superview === self.view else { return }
+
+        // Find and deactivate the existing bottom constraint
+        let existingBottomConstraints = self.view.constraints.filter {
+            ($0.firstItem as? WKWebView) == webView && $0.firstAttribute == .bottom
+        }
+        NSLayoutConstraint.deactivate(existingBottomConstraints)
+
+        // Create new bottom constraint based on enabled value
+        let bottomAnchor = enabled ? self.view.safeAreaLayoutGuide.bottomAnchor : self.view.bottomAnchor
+        NSLayoutConstraint.activate([
+            webView.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+        self.view.layoutIfNeeded()
     }
 }
 

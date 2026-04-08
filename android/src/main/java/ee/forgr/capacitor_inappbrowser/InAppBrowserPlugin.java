@@ -6,6 +6,11 @@ import android.content.ComponentName;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.drawable.Drawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.text.TextUtils;
@@ -16,6 +21,8 @@ import androidx.activity.result.ActivityResult;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
+import androidx.appcompat.content.res.AppCompatResources;
+import androidx.browser.customtabs.CustomTabColorSchemeParams;
 import androidx.browser.customtabs.CustomTabsCallback;
 import androidx.browser.customtabs.CustomTabsClient;
 import androidx.browser.customtabs.CustomTabsIntent;
@@ -55,7 +62,7 @@ import org.json.JSONObject;
 )
 public class InAppBrowserPlugin extends Plugin implements WebViewDialog.PermissionHandler {
 
-    private final String pluginVersion = "8.1.23";
+    private final String pluginVersion = "8.5.2";
 
     public static final String CUSTOM_TAB_PACKAGE_NAME = "com.android.chrome"; // Change when in stable
     private CustomTabsClient customTabsClient;
@@ -267,6 +274,13 @@ public class InAppBrowserPlugin extends Plugin implements WebViewDialog.Permissi
         }
     }
 
+    @Override
+    public void clearPendingPermissionRequest(PermissionRequest request) {
+        if (currentPermissionRequest == request) {
+            currentPermissionRequest = null;
+        }
+    }
+
     CustomTabsServiceConnection connection = new CustomTabsServiceConnection() {
         @Override
         public void onCustomTabsServiceConnected(ComponentName name, CustomTabsClient client) {
@@ -337,7 +351,66 @@ public class InAppBrowserPlugin extends Plugin implements WebViewDialog.Permissi
         }
         currentUrl = url;
         CustomTabsIntent.Builder builder = new CustomTabsIntent.Builder(getCustomTabsSession());
+
+        // --- Chrome Custom Tab UI customization ---
+
+        // Toolbar color (applied to both light and dark color schemes)
+        String toolbarColor = call.getString("toolbarColor");
+        if (toolbarColor != null) {
+            try {
+                int colorInt = Color.parseColor(toolbarColor);
+                CustomTabColorSchemeParams colorParams = new CustomTabColorSchemeParams.Builder()
+                    .setToolbarColor(colorInt)
+                    .setNavigationBarColor(colorInt)
+                    .build();
+                builder.setDefaultColorSchemeParams(colorParams);
+                builder.setColorSchemeParams(CustomTabsIntent.COLOR_SCHEME_DARK, colorParams);
+            } catch (IllegalArgumentException e) {
+                Log.w(getLogTag(), "Invalid toolbarColor value: " + toolbarColor, e);
+            }
+        }
+
+        // Auto-hide URL bar on scroll
+        if (call.getBoolean("urlBarHidingEnabled", false)) {
+            builder.setUrlBarHidingEnabled(true);
+        }
+
+        // Show page <title> instead of URL
+        if (call.getBoolean("showTitle", false)) {
+            builder.setShowTitle(true);
+        }
+
+        // Replace X close icon with a back arrow
+        if (call.getBoolean("showArrow", false)) {
+            Drawable arrowDrawable = AppCompatResources.getDrawable(getContext(), R.drawable.arrow_back_enabled);
+            if (arrowDrawable != null) {
+                Bitmap backArrow = Bitmap.createBitmap(
+                    arrowDrawable.getIntrinsicWidth(),
+                    arrowDrawable.getIntrinsicHeight(),
+                    Bitmap.Config.ARGB_8888
+                );
+                Canvas canvas = new Canvas(backArrow);
+                arrowDrawable.setBounds(0, 0, canvas.getWidth(), canvas.getHeight());
+                arrowDrawable.draw(canvas);
+                builder.setCloseButtonIcon(backArrow);
+            }
+        }
+
+        // Remove share action from overflow menu
+        if (call.getBoolean("disableShare", false)) {
+            builder.setShareState(CustomTabsIntent.SHARE_STATE_OFF);
+        }
+
         CustomTabsIntent tabsIntent = builder.build();
+
+        // Undocumented Chromium flags — these may stop working on future Chrome updates
+        if (call.getBoolean("disableBookmark", false)) {
+            tabsIntent.intent.putExtra("org.chromium.chrome.browser.customtabs.EXTRA_DISABLE_STAR_BUTTON", true);
+        }
+        if (call.getBoolean("disableDownload", false)) {
+            tabsIntent.intent.putExtra("org.chromium.chrome.browser.customtabs.EXTRA_DISABLE_DOWNLOAD_BUTTON", true);
+        }
+
         tabsIntent.intent.putExtra(Intent.EXTRA_REFERRER, Uri.parse(Intent.URI_ANDROID_APP_SCHEME + "//" + getContext().getPackageName()));
         tabsIntent.intent.putExtra(android.provider.Browser.EXTRA_HEADERS, this.getHeaders(call));
 
@@ -504,6 +577,8 @@ public class InAppBrowserPlugin extends Plugin implements WebViewDialog.Permissi
         options.setToolbarTextColor(call.getString("toolbarTextColor"));
         options.setArrow(Boolean.TRUE.equals(call.getBoolean("showArrow", false)));
         options.setIgnoreUntrustedSSLError(Boolean.TRUE.equals(call.getBoolean("ignoreUntrustedSSLError", false)));
+        options.setShowScreenshotButton(Boolean.TRUE.equals(call.getBoolean("showScreenshotButton", false)));
+        options.setAllowScreenshotsFromWebPage(Boolean.TRUE.equals(call.getBoolean("allowScreenshotsFromWebPage", false)));
 
         // Set text zoom if specified in options (default is 100)
         Integer textZoom = call.getInt("textZoom");
@@ -520,9 +595,9 @@ public class InAppBrowserPlugin extends Plugin implements WebViewDialog.Permissi
             }
         }
 
+        JSObject buttonNearDoneObj = call.getObject("buttonNearDone");
         try {
             // Try to set buttonNearDone if present, with better error handling
-            JSObject buttonNearDoneObj = call.getObject("buttonNearDone");
             if (buttonNearDoneObj != null) {
                 try {
                     // Provide better debugging for buttonNearDone
@@ -537,13 +612,8 @@ public class InAppBrowserPlugin extends Plugin implements WebViewDialog.Permissi
                             int resourceId = getContext().getResources().getIdentifier(icon, "drawable", getContext().getPackageName());
                             if (resourceId == 0) {
                                 Log.e("InAppBrowser", "Vector resource not found: " + icon);
-                                // List available drawable resources to help debugging
-                                try {
-                                    final StringBuilder availableResources = getStringBuilder();
-                                    Log.d("InAppBrowser", availableResources.toString());
-                                } catch (Exception e) {
-                                    Log.e("InAppBrowser", "Error listing resources: " + e.getMessage());
-                                }
+                                call.reject("buttonNearDone validation failed: vector resource not found: " + icon);
+                                return;
                             } else {
                                 Log.d("InAppBrowser", "Vector resource found with ID: " + resourceId);
                             }
@@ -555,10 +625,14 @@ public class InAppBrowserPlugin extends Plugin implements WebViewDialog.Permissi
                     options.setButtonNearDone(buttonNearDone);
                 } catch (Exception e) {
                     Log.e("InAppBrowser", "Error setting buttonNearDone: " + e.getMessage(), e);
+                    call.reject("buttonNearDone validation failed: " + e.getMessage());
+                    return;
                 }
             }
         } catch (Exception e) {
             Log.e("InAppBrowser", "Error processing buttonNearDone: " + e.getMessage(), e);
+            call.reject("buttonNearDone validation failed: " + e.getMessage());
+            return;
         }
 
         options.setShareDisclaimer(call.getObject("shareDisclaimer", null));
@@ -580,13 +654,23 @@ public class InAppBrowserPlugin extends Plugin implements WebViewDialog.Permissi
             options.setCloseModalDescription(call.getString("closeModalDescription", "Are you sure ?"));
             options.setCloseModalOk(call.getString("closeModalOk", "Ok"));
             options.setCloseModalCancel(call.getString("closeModalCancel", "Cancel"));
+            String closeModalURLPatternStr = call.getString("closeModalURLPattern");
+            if (closeModalURLPatternStr != null) {
+                try {
+                    options.setCloseModalURLPattern(Pattern.compile(closeModalURLPatternStr));
+                } catch (PatternSyntaxException e) {
+                    call.reject("Invalid closeModalURLPattern regex: " + e.getMessage());
+                    return;
+                }
+            }
         } else {
             // Reject if closeModal is false but closeModal options are provided
             if (
                 call.getData().has("closeModalTitle") ||
                 call.getData().has("closeModalDescription") ||
                 call.getData().has("closeModalOk") ||
-                call.getData().has("closeModalCancel")
+                call.getData().has("closeModalCancel") ||
+                call.getData().has("closeModalURLPattern")
             ) {
                 call.reject("closeModal options require closeModal to be true");
                 return;
@@ -601,14 +685,20 @@ public class InAppBrowserPlugin extends Plugin implements WebViewDialog.Permissi
         }
 
         // Validate buttonNearDone compatibility with toolbar type
-        if (call.getData().has("buttonNearDone")) {
+        if (buttonNearDoneObj != null && options.getShowScreenshotButton()) {
+            call.reject("showScreenshotButton is not compatible with buttonNearDone");
+            return;
+        }
+
+        if (buttonNearDoneObj != null || options.getShowScreenshotButton()) {
             String toolbarType = options.getToolbarType();
             if (
                 TextUtils.equals(toolbarType, "activity") ||
                 TextUtils.equals(toolbarType, "navigation") ||
                 TextUtils.equals(toolbarType, "blank")
             ) {
-                call.reject("buttonNearDone is not compatible with toolbarType: " + toolbarType);
+                String optionName = options.getShowScreenshotButton() ? "showScreenshotButton" : "buttonNearDone";
+                call.reject(optionName + " is not compatible with toolbarType: " + toolbarType);
                 return;
             }
         }
@@ -665,6 +755,18 @@ public class InAppBrowserPlugin extends Plugin implements WebViewDialog.Permissi
                 @Override
                 public void confirmBtnClicked(String url) {
                     notifyListeners("confirmBtnClicked", new JSObject().put("id", webViewId).put("url", url));
+                }
+
+                @Override
+                public void screenshotTaken(JSObject screenshot) {
+                    JSObject event = new JSObject();
+                    Iterator<String> keys = screenshot.keys();
+                    while (keys.hasNext()) {
+                        String key = keys.next();
+                        event.put(key, screenshot.opt(key));
+                    }
+                    event.put("id", webViewId);
+                    notifyListeners("screenshotTaken", event);
                 }
 
                 @Override
@@ -959,6 +1061,37 @@ public class InAppBrowserPlugin extends Plugin implements WebViewDialog.Permissi
     }
 
     @PluginMethod
+    public void takeScreenshot(PluginCall call) {
+        this.getActivity().runOnUiThread(
+            new Runnable() {
+                @Override
+                public void run() {
+                    String targetId = resolveTargetId(call);
+                    WebViewDialog dialog = resolveDialog(targetId);
+                    if (dialog == null) {
+                        call.reject("WebView is not initialized");
+                        return;
+                    }
+
+                    dialog.takeScreenshot(
+                        new WebViewDialog.ScreenshotResultCallback() {
+                            @Override
+                            public void onSuccess(JSObject screenshot) {
+                                call.resolve(screenshot);
+                            }
+
+                            @Override
+                            public void onError(String message) {
+                                call.reject(message);
+                            }
+                        }
+                    );
+                }
+            }
+        );
+    }
+
+    @PluginMethod
     public void goBack(PluginCall call) {
         this.getActivity().runOnUiThread(
             new Runnable() {
@@ -1205,6 +1338,56 @@ public class InAppBrowserPlugin extends Plugin implements WebViewDialog.Permissi
                 }
             }
         );
+    }
+
+    @PluginMethod
+    public void setEnabledSafeTopMargin(PluginCall call) {
+        Boolean enabledValue = call.getBoolean("enabled");
+        if (enabledValue == null) {
+            call.reject("'enabled' (boolean) is required");
+            return;
+        }
+        boolean enabled = enabledValue;
+        String targetId = resolveTargetId(call);
+        WebViewDialog dialog = resolveDialog(targetId);
+        if (dialog == null) {
+            call.reject("WebView is not initialized");
+            return;
+        }
+        this.getActivity().runOnUiThread(() -> {
+            try {
+                dialog.setEnabledSafeTopMargin(enabled);
+                call.resolve();
+            } catch (Exception e) {
+                Log.e("InAppBrowser", "Error setting safe top margin: " + e.getMessage());
+                call.reject("Failed to set safe top margin: " + e.getMessage());
+            }
+        });
+    }
+
+    @PluginMethod
+    public void setEnabledSafeBottomMargin(PluginCall call) {
+        Boolean enabledValue = call.getBoolean("enabled");
+        if (enabledValue == null) {
+            call.reject("'enabled' (boolean) is required");
+            return;
+        }
+        boolean enabled = enabledValue;
+        String targetId = resolveTargetId(call);
+        WebViewDialog dialog = resolveDialog(targetId);
+        if (dialog == null) {
+            call.reject("WebView is not initialized");
+            return;
+        }
+        this.getActivity().runOnUiThread(() -> {
+            try {
+                dialog.setEnabledSafeBottomMargin(enabled);
+                call.resolve();
+            } catch (Exception e) {
+                Log.e("InAppBrowser", "Error setting safe bottom margin: " + e.getMessage());
+                call.reject("Failed to set safe bottom margin: " + e.getMessage());
+            }
+        });
     }
 
     @PluginMethod

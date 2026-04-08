@@ -9,6 +9,7 @@ import type {
   DimensionOptions,
   OpenSecureWindowOptions,
   OpenSecureWindowResponse,
+  ScreenshotResult,
 } from './definitions';
 
 export class InAppBrowserWeb extends WebPlugin implements InAppBrowserPlugin {
@@ -74,6 +75,10 @@ export class InAppBrowserWeb extends WebPlugin implements InAppBrowserPlugin {
     return options;
   }
 
+  async takeScreenshot(_options?: { id?: string }): Promise<ScreenshotResult> {
+    throw this.unimplemented('Screenshots are not supported on web.');
+  }
+
   async goBack(): Promise<any> {
     console.log('goBack');
     return;
@@ -86,6 +91,16 @@ export class InAppBrowserWeb extends WebPlugin implements InAppBrowserPlugin {
   async updateDimensions(options: DimensionOptions): Promise<void> {
     console.log('updateDimensions', options);
     // Web platform doesn't support dimension control
+    return;
+  }
+
+  async setEnabledSafeTopMargin(_options: { enabled: boolean; id?: string }): Promise<void> {
+    console.log('setEnabledSafeTopMargin not supported on web');
+    return;
+  }
+
+  async setEnabledSafeBottomMargin(_options: { enabled: boolean; id?: string }): Promise<void> {
+    console.log('setEnabledSafeBottomMargin not supported on web');
     return;
   }
 

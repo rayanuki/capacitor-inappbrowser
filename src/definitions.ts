@@ -106,6 +106,70 @@ export interface OpenOptions {
    * @since 0.1.0
    */
   preventDeeplink?: boolean;
+
+  // --- Chrome Custom Tab customization (Android only, ignored on iOS) ---
+
+  /**
+   * Toolbar background color in hex format (e.g., "#1A1A2E").
+   * Applied to both light and dark color schemes.
+   * Also sets the navigation bar color to match.
+   * **Android only** — ignored on iOS.
+   * @since 8.2.0
+   */
+  toolbarColor?: string;
+
+  /**
+   * Whether the URL bar should auto-hide when the user scrolls down.
+   * The bar reappears on any upward scroll.
+   * **Android only** — ignored on iOS.
+   * @default false
+   * @since 8.2.0
+   */
+  urlBarHidingEnabled?: boolean;
+
+  /**
+   * Show the page's HTML <title> in the toolbar instead of the raw URL.
+   * The true URL is still visible when the user taps the title area.
+   * **Android only** — ignored on iOS.
+   * @default false
+   * @since 8.2.0
+   */
+  showTitle?: boolean;
+
+  /**
+   * Replace the default "X" close icon with a back arrow.
+   * Makes the Custom Tab feel like a native navigation push rather than a modal overlay.
+   * **Android only** — ignored on iOS.
+   * @default false
+   * @since 8.2.0
+   */
+  showArrow?: boolean;
+
+  /**
+   * Remove the share action from the overflow menu.
+   * **Android only** — ignored on iOS.
+   * @default false
+   * @since 8.2.0
+   */
+  disableShare?: boolean;
+
+  /**
+   * Hide the bookmark star icon in the overflow menu.
+   * Uses an undocumented Chromium intent extra — may stop working on future Chrome updates.
+   * **Android only** — ignored on iOS.
+   * @default false
+   * @since 8.2.0
+   */
+  disableBookmark?: boolean;
+
+  /**
+   * Hide the download icon in the overflow menu.
+   * Uses an undocumented Chromium intent extra — may stop working on future Chrome updates.
+   * **Android only** — ignored on iOS.
+   * @default false
+   * @since 8.2.0
+   */
+  disableDownload?: boolean;
 }
 
 export interface OpenSecureWindowOptions {
@@ -122,6 +186,14 @@ export interface OpenSecureWindowOptions {
    * The name of the broadcast channel to listen to, relevant only for web
    */
   broadcastChannelName?: string;
+  /**
+   * If true, the browser session will be ephemeral (no cookies or browsing data are shared with the system browser).
+   * On iOS, this sets `prefersEphemeralWebBrowserSession = true` on `ASWebAuthenticationSession`.
+   * On Android, ephemeral mode is always enabled via `FLAG_ACTIVITY_NO_HISTORY` regardless of this option.
+   * @default false
+   * @since 6.6.0
+   */
+  prefersEphemeralWebBrowserSession?: boolean;
 }
 
 export interface OpenSecureWindowResponse {
@@ -152,6 +224,33 @@ export interface DisclaimerOptions {
    * @default "Cancel"
    */
   cancelBtn: string;
+}
+
+export interface ScreenshotResult {
+  /**
+   * Image format used for the screenshot.
+   */
+  format: 'png';
+  /**
+   * MIME type of the generated screenshot.
+   */
+  mimeType: 'image/png';
+  /**
+   * Base64-encoded screenshot payload without the data URL prefix.
+   */
+  base64: string;
+  /**
+   * Data URL for direct use in HTML img tags or uploads.
+   */
+  dataUrl: string;
+  /**
+   * Screenshot width in pixels.
+   */
+  width: number;
+  /**
+   * Screenshot height in pixels.
+   */
+  height: number;
 }
 
 export interface CloseWebviewOptions {
@@ -246,6 +345,7 @@ export interface OpenWebViewOptions {
    * - `window.mobileApp.close()`: Closes the webview from JavaScript
    * - `window.mobileApp.postMessage(obj)`: Sends a message to the app (listen via "messageFromWebview" event)
    * - `window.mobileApp.hide()` / `window.mobileApp.show()` when allowWebViewJsVisibilityControl is true in CapacitorConfig
+   * - `window.mobileApp.takeScreenshot()` when `allowScreenshotsFromWebPage` is true
    *
    * @example
    * // In your webpage loaded in the webview:
@@ -259,6 +359,14 @@ export interface OpenWebViewOptions {
    * @since 6.10.0
    */
   jsInterface?: never; // This property doesn't exist, it's just for documentation
+  /**
+   * Allows page JavaScript to call `window.mobileApp.takeScreenshot()`.
+   * Disabled by default so only the host app can trigger native screenshots through the plugin API.
+   *
+   * @default false
+   * @since 8.4.0
+   */
+  allowScreenshotsFromWebPage?: boolean;
   /**
    * Share options for the webview. When provided, shows a disclaimer dialog before sharing content.
    * This is useful for:
@@ -336,6 +444,9 @@ export interface OpenWebViewOptions {
   /**
    * Open url in a new window fullscreen
    * isPresentAfterPageLoad: if true, the browser will be presented after the page is loaded, if false, the browser will be presented immediately.
+   * Promise timing: on Android, `openWebView()` resolves with the webview id when the webview is ready to be controlled
+   * (immediately for hidden/immediate presentation, after the first page load when `isPresentAfterPageLoad` is `true`).
+   * On iOS, the promise resolves with the id as soon as the native webview is created, even if presentation is deferred.
    * @since 0.1.0
    * @default false
    * @example
@@ -400,6 +511,17 @@ export interface OpenWebViewOptions {
    * @default "Cancel"
    */
   closeModalCancel?: string;
+  /**
+   * closeModalURLPattern: a regex pattern to match against the current URL when the close button is pressed.
+   * When provided along with closeModal: true, the close confirmation modal is only shown if the current URL matches this pattern.
+   * If the current URL does not match, the browser closes immediately without showing the modal.
+   * Requires closeModal to be true.
+   * @since 7.2.0
+   * @example
+   * closeModal: true,
+   * closeModalURLPattern: ".*checkout.*"
+   */
+  closeModalURLPattern?: string;
   /**
    * visibleTitle: if true the website title would be shown else shown empty
    * @since 1.2.5
@@ -506,6 +628,16 @@ export interface OpenWebViewOptions {
       height?: number;
     };
   };
+  /**
+   * Shows a native screenshot button near the done/close button.
+   * The button is hidden by default and captures the current viewport when tapped.
+   * This option uses the same toolbar slot as `buttonNearDone` and is therefore incompatible with it.
+   * The button is only shown when toolbarType is not "activity", "navigation", or "blank".
+   *
+   * @default false
+   * @since 8.4.0
+   */
+  showScreenshotButton?: boolean;
   /**
    * textZoom: sets the text zoom of the page in percent.
    * Allows users to increase or decrease the text size for better readability.
@@ -776,6 +908,10 @@ export interface InAppBrowserPlugin {
    * When you open a webview with this method, a JavaScript interface is automatically injected that provides:
    * - `window.mobileApp.close()`: Closes the webview from JavaScript
    * - `window.mobileApp.postMessage({detail: {message: "myMessage"}})`: Sends a message from the webview to the app, detail object is the data you want to send to the webview
+   * - `window.mobileApp.takeScreenshot()` when `allowScreenshotsFromWebPage` is true
+   *
+   * Promise timing differs by platform when `isPresentAfterPageLoad` is used.
+   * Android resolves with `{ id }` after the dialog is ready to control, while iOS resolves with `{ id }` immediately after creating the native webview.
    *
    * @returns Promise that resolves with the created webview id.
    * @since 0.1.0
@@ -793,6 +929,11 @@ export interface InAppBrowserPlugin {
    * When `id` is omitted, broadcasts to all open webviews.
    */
   postMessage(options: { detail: Record<string, any>; id?: string }): Promise<void>;
+  /**
+   * Captures the current webview viewport as a PNG screenshot.
+   * When `id` is omitted, targets the active webview.
+   */
+  takeScreenshot(options?: { id?: string }): Promise<ScreenshotResult>;
   /**
    * Sets the URL of the webview.
    * When `id` is omitted, targets the active webview.
@@ -833,6 +974,15 @@ export interface InAppBrowserPlugin {
   ): Promise<PluginListenerHandle>;
 
   /**
+   * Will be triggered whenever a screenshot is captured from the plugin API,
+   * the native screenshot button, or the injected JavaScript bridge.
+   */
+  addListener(
+    eventName: 'screenshotTaken',
+    listenerFunc: (event: ScreenshotResult & { id?: string }) => void,
+  ): Promise<PluginListenerHandle>;
+
+  /**
    * Will be triggered when page is loaded
    */
   addListener(
@@ -870,6 +1020,20 @@ export interface InAppBrowserPlugin {
    * @returns Promise that resolves when dimensions are updated
    */
   updateDimensions(options: DimensionOptions & { id?: string }): Promise<void>;
+
+  /**
+   * Sets the enabled safe top margin of the webview at runtime.
+   * When `id` is omitted, targets the active webview.
+   * On Web, this method is a no-op and resolves without changing layout.
+   */
+  setEnabledSafeTopMargin(options: { enabled: boolean; id?: string }): Promise<void>;
+
+  /**
+   * Sets the enabled safe bottom margin of the webview at runtime.
+   * When `id` is omitted, targets the active webview.
+   * On Web, this method is a no-op and resolves without changing layout.
+   */
+  setEnabledSafeBottomMargin(options: { enabled: boolean; id?: string }): Promise<void>;
 
   /**
    * Opens a secured window for OAuth2 authentication.
@@ -982,6 +1146,14 @@ export interface InAppBrowserWebViewAPIs {
      * @since 8.0.8
      */
     show(): void;
+
+    /**
+     * Capture the current WebView viewport as a PNG screenshot.
+     * Requires `allowScreenshotsFromWebPage` to be enabled when opening the webview.
+     *
+     * @since 8.4.0
+     */
+    takeScreenshot(): Promise<ScreenshotResult>;
   };
 
   /**
