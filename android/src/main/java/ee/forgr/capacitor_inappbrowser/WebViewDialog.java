@@ -463,8 +463,6 @@ public class WebViewDialog extends Dialog {
             }
         }
 
-        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
-
         // Make status bar transparent
         if (getWindow() != null) {
             getWindow().setStatusBarColor(Color.TRANSPARENT);
