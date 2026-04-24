@@ -6,9 +6,17 @@ import {
   BackgroundColor,
   InvisibilityMode,
 } from "@capgo/inappbrowser";
+import { setupProxyDemoButtons } from "./proxy-demo.js";
+import { setupProxyRegression } from "./proxy-regression.js";
+import { attachKeyboardRegressionHarness } from "./keyboard-regression.js";
+import { url as configuredTestWebappUrl } from "./url.js";
 
 // Default URL configuration
 let testWebappUrl = "http://localhost:8000/index.php";
+
+function getConfiguredTestWebappUrl() {
+  return configuredTestWebappUrl || testWebappUrl;
+}
 
 window.customElements.define(
   "capacitor-welcome",
@@ -72,6 +80,26 @@ window.customElements.define(
         <p>
           This app is designed to test the Capacitor InAppBrowser plugin, specifically to reproduce and debug back button navigation issues.
         </p>
+        <h2>Download Handling</h2>
+        <p>
+          Open a page that immediately downloads a blob text file. With native download handling enabled, the downloaded file should reopen inside the webview.
+        </p>
+        <p style="margin-bottom: 10px;">
+          <label style="display: flex; align-items: center; gap: 8px; font-size: 0.9em;">
+            <input type="checkbox" id="handle-downloads-toggle" checked style="width: 18px; height: 18px; cursor: pointer;" />
+            <span>Handle downloads natively</span>
+          </label>
+        </p>
+        <p>
+          <button class="button" id="open-download-demo" style="background-color: #198754;">Open Auto Download Demo</button>
+        </p>
+        <p>
+          <button class="button" id="open-download-demo-listener" style="background-color: #0ea5e9;">Open Auto Download Demo + Close On Event</button>
+        </p>
+        <p id="download-event-status" style="margin-top: 8px; padding: 10px 12px; border-radius: 8px; background-color: #f8f9fa; color: #495057; font-size: 0.85em;">
+          Download listener idle.
+        </p>
+        <hr />
         <h2>Custom URL</h2>
         <p>
           Enter a URL to open in the in-app browser.
@@ -121,6 +149,62 @@ window.customElements.define(
         <p>
           <button class="button" id="open-custom-url" style="background-color: #007bff;">Open Custom URL</button>
         </p>
+        <h2>Proxy Regression</h2>
+        <p>
+          Run a self-contained proxy flow that serves the page, script, fetch, and XHR through <code>addProxyHandler()</code>.
+        </p>
+        <p>
+          <button class="button" id="run-proxy-regression" style="background-color: #5b39f7;">Run Proxy Regression Test</button>
+        </p>
+        <div id="proxy-regression-status" style="margin-top: 10px; padding: 10px; background-color: #eef1ff; border-radius: 5px; font-size: 0.8em; color: #1b1f3b;">
+          <strong>Status:</strong> <span id="proxy-regression-status-text">Not started</span>
+          <div id="proxy-regression-details" style="margin-top: 6px;"></div>
+        </div>
+        <hr />
+        <h2>Proxy Demo Scenarios</h2>
+        <p>
+          Open real websites and exercise the proxy paths directly from this example app.
+        </p>
+        <p style="display: flex; gap: 8px; flex-wrap: wrap;">
+          <button class="button" id="proxy-demo-grailed-stub" style="background-color: #1f7a8c;">Grailed SDK Stub Proxy</button>
+          <button class="button" id="proxy-demo-grailed-google-login" style="background-color: #126b4c;">Grailed Google Login Proxy</button>
+          <button class="button" id="proxy-demo-grailed-background-login" style="background-color: #0b8f68;">Grailed Background Login</button>
+          <button class="button" id="proxy-demo-facebook-login" style="background-color: #1877f2;">Facebook Login</button>
+          <button class="button" id="proxy-demo-facebook-script" style="background-color: #0f5dcf;">Facebook Script Proxy</button>
+        </p>
+        <div style="display: grid; gap: 8px; max-width: 440px; margin-bottom: 12px;">
+          <input id="proxy-demo-google-email" type="email" placeholder="Google email" style="padding: 10px; border: 1px solid #c9d7d1; border-radius: 6px;" />
+          <input id="proxy-demo-google-password" type="password" placeholder="Google password" style="padding: 10px; border: 1px solid #c9d7d1; border-radius: 6px;" />
+          <input id="proxy-demo-google-otp" type="text" placeholder="Google 2FA code (optional)" style="padding: 10px; border: 1px solid #c9d7d1; border-radius: 6px;" />
+        </div>
+        <p style="font-size: 0.75em; color: #3f5f53; margin-top: -4px;">
+          The background Grailed demo keeps both the Grailed page and the Google popup hidden, drives them with injected JavaScript, and reports each step here.
+        </p>
+        <p style="display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px;">
+          <button class="button" id="proxy-demo-show-primary" style="background-color: #5b7c6f;" disabled>Show hidden Grailed window</button>
+          <button class="button" id="proxy-demo-show-popup" style="background-color: #466d8f;" disabled>Show hidden popup</button>
+        </p>
+        <div id="proxy-demo-status" style="margin-top: 10px; padding: 10px; background-color: #eefaf7; border-radius: 5px; font-size: 0.8em; color: #12372a;">
+          <strong>Status:</strong> <span id="proxy-demo-status-text">Not started</span>
+          <div id="proxy-demo-details" style="margin-top: 6px; white-space: pre-wrap; word-break: break-word;"></div>
+          <div style="margin-top: 10px;">
+            <strong>Steps:</strong>
+            <pre id="proxy-demo-history" style="margin-top: 6px; padding: 8px; background: rgba(18,55,42,0.06); border-radius: 4px; white-space: pre-wrap; word-break: break-word; max-height: 180px; overflow-y: auto;">No events yet.</pre>
+          </div>
+        </div>
+        <hr />
+        <h2>Target Blank Test</h2>
+        <p>
+          Open a deterministic target="_blank" HTTPS test page inside the plugin and verify that the linked page stays inside the current webview.
+        </p>
+        <p>
+          <button class="button" id="open-blank-target-test" style="background-color: #0f766e;">Open Blank Target HTTPS Test</button>
+        </p>
+        <div id="blank-target-test-status" style="margin-top: 10px; padding: 10px; background-color: #ecfeff; border-radius: 5px; font-size: 0.8em; color: #134e4a;">
+          <div><strong>Blank target test status:</strong> <span id="blank-target-status-text">Idle</span></div>
+          <div><strong>Blank target test result:</strong> <span id="blank-target-result-text">not run</span></div>
+          <div><strong>Blank target last URL:</strong> <span id="blank-target-last-url-text">none</span></div>
+        </div>
         <hr />
         <h2>In-App Browser Demo</h2>
         <p>
@@ -201,6 +285,8 @@ window.customElements.define(
     connectedCallback() {
       const self = this;
 
+      attachKeyboardRegressionHarness();
+
       // Helper function to validate URL
       function isValidUrl(string) {
         try {
@@ -210,6 +296,301 @@ window.customElements.define(
           return false;
         }
       }
+
+      function createAutoDownloadDemoUrl() {
+        const content = [
+          "Capgo download demo successful.",
+          "This file was downloaded natively by InAppBrowser.",
+        ].join("\\n");
+
+        const downloadDemoHtml = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Auto Download Demo</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: linear-gradient(180deg, #f8f9fa 0%, #dbeafe 100%);
+        color: #111827;
+      }
+      .card {
+        width: min(420px, calc(100vw - 32px));
+        padding: 24px;
+        border-radius: 20px;
+        background: rgba(255, 255, 255, 0.92);
+        box-shadow: 0 24px 60px rgba(15, 23, 42, 0.14);
+      }
+      h1 {
+        margin: 0 0 12px;
+        font-size: 1.4rem;
+      }
+      p {
+        margin: 0;
+        line-height: 1.5;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Preparing download</h1>
+      <p id="status">Creating a sample blob file and handing it to the native download flow.</p>
+    </div>
+    <script>
+      const status = document.getElementById("status");
+      const blob = new Blob([${JSON.stringify(content)}], { type: "text/plain" });
+      const downloadUrl = URL.createObjectURL(blob);
+      const downloadLink = document.createElement("a");
+      downloadLink.href = downloadUrl;
+      downloadLink.download = "capgo-download-demo.txt";
+      downloadLink.textContent = "Download sample file";
+      document.body.appendChild(downloadLink);
+      status.textContent = "Starting download...";
+      window.setTimeout(() => downloadLink.click(), 300);
+    </script>
+  </body>
+</html>`;
+
+        return `data:text/html;charset=utf-8,${encodeURIComponent(downloadDemoHtml)}`;
+      }
+
+      let closeOnNextDownloadEvent = false;
+      const downloadStatusElement = () => self.shadowRoot.querySelector("#download-event-status");
+      const downloadListenerButtonElement = () => self.shadowRoot.querySelector("#open-download-demo-listener");
+
+      function setDownloadStatus(message, { backgroundColor = "#f8f9fa", color = "#495057" } = {}) {
+        const statusElement = downloadStatusElement();
+        if (!statusElement) {
+          return;
+        }
+
+        statusElement.textContent = message;
+        statusElement.style.backgroundColor = backgroundColor;
+        statusElement.style.color = color;
+      }
+
+      function setDownloadListenerButtonLabel(label) {
+        const button = downloadListenerButtonElement();
+        if (!button) {
+          return;
+        }
+        button.textContent = label;
+      }
+
+      let downloadListenerHandles = [];
+
+      async function createDownloadListeners() {
+        while (downloadListenerHandles.length > 0) {
+          const listenerHandle = downloadListenerHandles.pop();
+          if (!listenerHandle || typeof listenerHandle.remove !== "function") {
+            continue;
+          }
+          try {
+            await listenerHandle.remove();
+          } catch (error) {
+            console.warn("Could not remove stale download listener:", error);
+          }
+        }
+
+        downloadListenerHandles = await Promise.all([
+          InAppBrowser.addListener("downloadCompleted", (event) => {
+            setDownloadListenerButtonLabel(`Event OK: ${event.fileName}`);
+            setDownloadStatus(
+              `Download completed: ${event.fileName} via ${event.handledBy}`,
+              { backgroundColor: "#dcfce7", color: "#166534" },
+            );
+
+            if (closeOnNextDownloadEvent && event.id) {
+              closeOnNextDownloadEvent = false;
+              InAppBrowser.close({ id: event.id }).catch((error) => {
+                console.warn("Could not close webview after download event:", error);
+              });
+            }
+          }),
+          InAppBrowser.addListener("downloadFailed", (event) => {
+            closeOnNextDownloadEvent = false;
+            setDownloadListenerButtonLabel("Event Failed");
+            const fileLabel = event.fileName ? ` for ${event.fileName}` : "";
+            setDownloadStatus(
+              `Download failed${fileLabel}: ${event.error}`,
+              { backgroundColor: "#fee2e2", color: "#991b1b" },
+            );
+          }),
+        ]);
+
+        return downloadListenerHandles;
+      }
+
+      async function openAutoDownloadDemo({ closeOnEvent = false } = {}) {
+        const handleDownloadsToggle = self.shadowRoot.querySelector("#handle-downloads-toggle");
+        closeOnNextDownloadEvent = closeOnEvent && handleDownloadsToggle.checked;
+        setDownloadListenerButtonLabel(
+          closeOnEvent && handleDownloadsToggle.checked
+            ? "Waiting For Download Event..."
+            : "Open Auto Download Demo + Close On Event",
+        );
+        setDownloadStatus(
+          handleDownloadsToggle.checked
+            ? closeOnEvent
+              ? "Waiting for native download event, then closing the webview..."
+              : "Waiting for native download event..."
+            : "Native download handling disabled for this run.",
+          {
+            backgroundColor: handleDownloadsToggle.checked ? "#e0f2fe" : "#f8f9fa",
+            color: handleDownloadsToggle.checked ? "#075985" : "#495057",
+          },
+        );
+
+        try {
+          await createDownloadListeners();
+          await InAppBrowser.openWebView({
+            url: createAutoDownloadDemoUrl(),
+            title: "Auto Download Demo",
+            toolbarColor: "#198754",
+            toolbarType: ToolBarType.NAVIGATION,
+            backgroundColor: BackgroundColor.WHITE,
+            visibleTitle: true,
+            showReloadButton: true,
+            enabledSafeBottomMargin: true,
+            handleDownloads: handleDownloadsToggle.checked,
+          });
+        } catch (error) {
+          closeOnNextDownloadEvent = false;
+          console.error("Error opening auto download demo:", error);
+        }
+      }
+
+      const blankTargetExpectedUrl = "https://example.com/#blank-target-webview";
+      const blankTargetTestHtml = `
+        <!doctype html>
+        <html lang="en">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <title>Target Blank Test Page</title>
+            <style>
+              body {
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                padding: 24px;
+                line-height: 1.5;
+                color: #0f172a;
+                background: #f8fafc;
+              }
+              a {
+                display: inline-block;
+                margin-top: 16px;
+                padding: 12px 16px;
+                border-radius: 999px;
+                background: #0f766e;
+                color: white;
+                text-decoration: none;
+                font-weight: 600;
+              }
+            </style>
+          </head>
+          <body>
+            <h1>Target Blank Test Page</h1>
+            <p>This link should open inside the current InAppBrowser webview.</p>
+            <a href="${blankTargetExpectedUrl}" target="_blank" rel="noopener noreferrer">Open Example Domain</a>
+          </body>
+        </html>
+      `;
+      const blankTargetTestUrl = `data:text/html;charset=utf-8,${encodeURIComponent(blankTargetTestHtml)}`;
+      const blankTargetStatusText = self.shadowRoot.querySelector("#blank-target-status-text");
+      const blankTargetResultText = self.shadowRoot.querySelector("#blank-target-result-text");
+      const blankTargetLastUrlText = self.shadowRoot.querySelector("#blank-target-last-url-text");
+      let blankTargetTestActive = false;
+      let blankTargetWebViewId = null;
+      let blankTargetListenerHandles = [];
+
+      function setBlankTargetState({ status, result, lastUrl }) {
+        blankTargetStatusText.textContent = status;
+        blankTargetResultText.textContent = result;
+        blankTargetLastUrlText.textContent = lastUrl;
+      }
+
+      function isBlankTargetEvent(result) {
+        return blankTargetTestActive && result?.id === blankTargetWebViewId;
+      }
+
+      async function clearBlankTargetListeners() {
+        const handles = blankTargetListenerHandles;
+        blankTargetListenerHandles = [];
+
+        await Promise.all(
+          handles.map((handle) => {
+            if (!handle || typeof handle.remove !== "function") {
+              return Promise.resolve();
+            }
+
+            return Promise.resolve(handle.remove()).catch(() => {});
+          }),
+        );
+      }
+
+      async function attachBlankTargetListeners() {
+        await clearBlankTargetListeners();
+
+        blankTargetListenerHandles = [
+          await InAppBrowser.addListener("urlChangeEvent", (result) => {
+            if (!isBlankTargetEvent(result)) {
+              return;
+            }
+
+            setBlankTargetState({
+              status: result.url === blankTargetExpectedUrl ? "Linked page loaded" : "Navigating",
+              result: blankTargetResultText.textContent,
+              lastUrl: result.url,
+            });
+          }),
+          await InAppBrowser.addListener("closeEvent", async (result) => {
+            if (!isBlankTargetEvent(result)) {
+              return;
+            }
+
+            const closedUrl = result.url || "unknown";
+            blankTargetTestActive = false;
+            blankTargetWebViewId = null;
+
+            setBlankTargetState({
+              status: "Closed",
+              result:
+                closedUrl === blankTargetExpectedUrl
+                  ? "internal navigation confirmed"
+                  : `closed on ${closedUrl}`,
+              lastUrl: closedUrl,
+            });
+
+            await clearBlankTargetListeners();
+          }),
+          await InAppBrowser.addListener("pageLoadError", async (result) => {
+            if (!isBlankTargetEvent(result)) {
+              return;
+            }
+
+            blankTargetTestActive = false;
+            blankTargetWebViewId = null;
+            setBlankTargetState({
+              status: "Page load error",
+              result: "page load error",
+              lastUrl: blankTargetLastUrlText.textContent,
+            });
+
+            await clearBlankTargetListeners();
+          }),
+        ];
+      }
+
+      setBlankTargetState({
+        status: "Idle",
+        result: "not run",
+        lastUrl: "none",
+      });
 
       async function fetchHiddenDomContent({ statusText, resultDiv, domOutput }) {
         statusText.textContent = "Refreshing DOM content...";
@@ -245,6 +626,89 @@ window.customElements.define(
           domOutput.textContent = "";
         }
       }
+
+      const maestroReadyBanner = document.getElementById("maestro-ready-banner");
+      const maestroRunProxyButton = document.getElementById("maestro-run-proxy");
+      const maestroProxyStatus = document.getElementById("maestro-proxy-status");
+      const maestroProxyDetails = document.getElementById("maestro-proxy-details");
+
+      const withMaestroNativeHarness = (callback) => {
+        const harness = window.MaestroNativeHarness;
+        if (!harness || typeof callback !== "function") {
+          return;
+        }
+        try {
+          callback(harness);
+        } catch (_error) {}
+      };
+
+      const syncMaestroNativeReady = (ready) => {
+        withMaestroNativeHarness((harness) => {
+          if (typeof harness.setReady === "function") {
+            harness.setReady(Boolean(ready));
+          }
+        });
+      };
+
+      const syncMaestroNativeRunning = (running) => {
+        withMaestroNativeHarness((harness) => {
+          if (typeof harness.setRunning === "function") {
+            harness.setRunning(Boolean(running));
+          }
+        });
+      };
+
+      const syncMaestroNativeStatus = (message, details = "") => {
+        withMaestroNativeHarness((harness) => {
+          if (typeof harness.setStatus === "function") {
+            harness.setStatus(message, details);
+          }
+        });
+      };
+
+      const updateMaestroStatus = (message, details = "") => {
+        if (maestroProxyStatus) {
+          maestroProxyStatus.textContent = message;
+        }
+        if (maestroProxyDetails) {
+          maestroProxyDetails.textContent = details;
+        }
+        syncMaestroNativeStatus(message, details);
+      };
+
+      const updateMaestroRunning = (running) => {
+        if (maestroRunProxyButton) {
+          maestroRunProxyButton.disabled = running;
+        }
+        syncMaestroNativeRunning(running);
+      };
+
+      const proxyRegressionControls = setupProxyRegression(self.shadowRoot, {
+        onStatusChange: updateMaestroStatus,
+        onRunningChange: updateMaestroRunning,
+      });
+
+      if (proxyRegressionControls?.run && maestroRunProxyButton) {
+        window.__capgoRunMaestroProxy = () => {
+          proxyRegressionControls.run({
+            keepBrowserOpenOnFinish: typeof window.MaestroNativeHarness === "undefined",
+          });
+        };
+        maestroRunProxyButton.addEventListener("click", () => {
+          proxyRegressionControls.run({ keepBrowserOpenOnFinish: true });
+        });
+        maestroRunProxyButton.disabled = false;
+        if (maestroReadyBanner) {
+          maestroReadyBanner.textContent = "Maestro Ready";
+        }
+        syncMaestroNativeReady(true);
+      } else if (maestroReadyBanner) {
+        maestroReadyBanner.textContent = "Maestro Unavailable";
+        window.__capgoRunMaestroProxy = undefined;
+        syncMaestroNativeReady(false);
+      }
+
+      setupProxyDemoButtons(self.shadowRoot);
 
       // Custom URL handler
       self.shadowRoot
@@ -442,6 +906,45 @@ window.customElements.define(
           }
         });
 
+      self.shadowRoot
+        .querySelector("#open-blank-target-test")
+        .addEventListener("click", async function () {
+          blankTargetTestActive = true;
+          blankTargetWebViewId = null;
+          setBlankTargetState({
+            status: "Opening test webview...",
+            result: "waiting for navigation",
+            lastUrl: "none",
+          });
+
+          try {
+            await attachBlankTargetListeners();
+
+            const { id } = await InAppBrowser.openWebView({
+              url: blankTargetTestUrl,
+              toolbarType: ToolBarType.COMPACT,
+              backgroundColor: BackgroundColor.WHITE,
+              title: "Target Blank Test",
+              visibleTitle: true,
+              showReloadButton: false,
+              activeNativeNavigationForWebview: false,
+              enabledSafeBottomMargin: true,
+              openBlankTargetInWebView: true,
+            });
+            blankTargetWebViewId = id;
+          } catch (e) {
+            blankTargetTestActive = false;
+            blankTargetWebViewId = null;
+            await clearBlankTargetListeners();
+            console.error("Error opening blank target test:", e);
+            setBlankTargetState({
+              status: "Error",
+              result: e.message,
+              lastUrl: "none",
+            });
+          }
+        });
+
       // Add Enter key support for the input field
       self.shadowRoot
         .querySelector("#custom-url-input")
@@ -523,6 +1026,18 @@ window.customElements.define(
         });
 
       self.shadowRoot
+        .querySelector("#open-download-demo")
+        .addEventListener("click", async function () {
+          await openAutoDownloadDemo({ closeOnEvent: false });
+        });
+
+      self.shadowRoot
+        .querySelector("#open-download-demo-listener")
+        .addEventListener("click", async function () {
+          await openAutoDownloadDemo({ closeOnEvent: true });
+        });
+
+      self.shadowRoot
         .querySelector("#system-bars-show-all")
         .addEventListener("click", async function () {
           try {
@@ -595,16 +1110,7 @@ window.customElements.define(
         .querySelector("#open-test-webapp")
         .addEventListener("click", async function (e) {
           try {
-            // Try to load custom URL configuration
-            let urlToUse = testWebappUrl;
-            try {
-              const { url } = await import("./url.js");
-              urlToUse = url;
-            } catch (e) {
-              console.warn(
-                "url.js not found, using default URL. Copy url.js.example to url.js and configure your server URL.",
-              );
-            }
+            const urlToUse = getConfiguredTestWebappUrl();
 
             await InAppBrowser.openWebView({
               url: urlToUse,
@@ -663,6 +1169,7 @@ window.customElements.define(
             metricsDiv.style.display = "none";
 
             await InAppBrowser.removeAllListeners();
+            downloadListenerHandles = [];
             await InAppBrowser.openWebView({
               url: "https://example.com",
               hidden: true,
@@ -836,16 +1343,7 @@ window.customElements.define(
         .querySelector("#open-test-webapp-activity")
         .addEventListener("click", async function (e) {
           try {
-            // Try to load custom URL configuration
-            let urlToUse = testWebappUrl;
-            try {
-              const { url } = await import("./url.js");
-              urlToUse = url;
-            } catch (e) {
-              console.warn(
-                "url.js not found, using default URL. Copy url.js.example to url.js and configure your server URL.",
-              );
-            }
+            const urlToUse = getConfiguredTestWebappUrl();
 
             await InAppBrowser.openWebView({
               url: urlToUse,

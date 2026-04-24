@@ -38,10 +38,14 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowManager;
+import android.view.inputmethod.InputMethodManager;
+import android.webkit.ConsoleMessage;
+import android.webkit.CookieManager;
 import android.webkit.HttpAuthHandler;
 import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
 import android.webkit.SslErrorHandler;
+import android.webkit.URLUtil;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
@@ -71,36 +75,63 @@ import com.getcapacitor.PluginCall;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.net.URL;
+import java.net.URLConnection;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.security.Principal;
 import java.security.PrivateKey;
+import java.security.SecureRandom;
+import java.security.cert.CertPathValidatorException;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateExpiredException;
+import java.security.cert.CertificateNotYetValidException;
 import java.security.cert.X509Certificate;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.KeyManager;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.X509KeyManager;
+import javax.net.ssl.X509TrustManager;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-public class WebViewDialog extends Dialog {
+public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyRequestLocator {
+
+    private static final long HOST_WEBVIEW_INSET_RETRY_DELAY_MS = 160L;
 
     private static class ProxiedRequest {
 
         private WebResourceResponse response;
         private final Semaphore semaphore;
+        private NativeRequestContext requestContext;
+        private NativeResponseData nativeResponse;
+        private boolean canceled;
+        private boolean timedOut;
 
         public WebResourceResponse getResponse() {
             return response;
@@ -109,6 +140,177 @@ public class WebViewDialog extends Dialog {
         public ProxiedRequest() {
             this.semaphore = new Semaphore(0);
             this.response = null;
+        }
+    }
+
+    private static class NativeRequestContext {
+
+        private String url;
+        private String method;
+        private Map<String, String> headers;
+        private String base64Body;
+        private boolean mainFrame;
+        private String credentialsMode;
+
+        NativeRequestContext(
+            String url,
+            String method,
+            Map<String, String> headers,
+            String base64Body,
+            boolean mainFrame,
+            String credentialsMode
+        ) {
+            this.url = url;
+            this.method = method;
+            this.headers = headers != null ? new HashMap<>(headers) : new HashMap<>();
+            this.base64Body = base64Body != null ? base64Body : "";
+            this.mainFrame = mainFrame;
+            this.credentialsMode = credentialsMode != null ? credentialsMode : "same-origin";
+        }
+    }
+
+    private static class NativeResponseData {
+
+        private int statusCode;
+        private String contentType;
+        private Map<String, String> headers;
+        private byte[] bodyBytes;
+
+        NativeResponseData(int statusCode, String contentType, Map<String, String> headers, byte[] bodyBytes) {
+            this.statusCode = statusCode;
+            this.contentType = contentType != null ? contentType : "application/octet-stream";
+            this.headers = headers != null ? new HashMap<>(headers) : new HashMap<>();
+            this.bodyBytes = bodyBytes != null ? bodyBytes : new byte[0];
+        }
+    }
+
+    private static class RedirectReplayResult {
+
+        private final NativeRequestContext requestContext;
+        private final NativeResponseData responseData;
+
+        RedirectReplayResult(NativeRequestContext requestContext, NativeResponseData responseData) {
+            this.requestContext = requestContext;
+            this.responseData = responseData;
+        }
+    }
+
+    private static class LegacyInitialProxyResult {
+
+        private final boolean canceled;
+        private final NativeResponseData responseData;
+        private final String requestUrl;
+
+        LegacyInitialProxyResult(boolean canceled, NativeResponseData responseData, String requestUrl) {
+            this.canceled = canceled;
+            this.responseData = responseData;
+            this.requestUrl = requestUrl;
+        }
+    }
+
+    private static final int REQUEST_CONNECT_TIMEOUT_MS = 15_000;
+    private static final int REQUEST_READ_TIMEOUT_MS = 30_000;
+    private static final int MAX_WEBVIEW_PROXY_REDIRECTS = 10;
+    private static final int MAX_MANAGED_DOWNLOAD_REDIRECTS = 10;
+    private static final int BLOB_DOWNLOAD_CHUNK_BYTES = 64 * 1024;
+    private static final long MAX_LEGACY_BLOB_DOWNLOAD_BYTES = 512L * 1024L;
+    private static final long MAX_INLINE_TEXT_PREVIEW_BYTES = 512L * 1024L;
+
+    private static class BlobDownloadSession {
+
+        private final File outputFile;
+        private final String sourceUrl;
+        private final String mimeType;
+        private final FileOutputStream outputStream;
+        private final long expectedSize;
+        private long bytesWritten;
+
+        private BlobDownloadSession(File outputFile, String sourceUrl, String mimeType, FileOutputStream outputStream, long expectedSize) {
+            this.outputFile = outputFile;
+            this.sourceUrl = sourceUrl;
+            this.mimeType = mimeType;
+            this.outputStream = outputStream;
+            this.expectedSize = expectedSize;
+            this.bytesWritten = 0L;
+        }
+    }
+
+    private static class ClientCertificateIdentity {
+
+        private final PrivateKey privateKey;
+        private final X509Certificate[] certificateChain;
+
+        private ClientCertificateIdentity(PrivateKey privateKey, X509Certificate[] certificateChain) {
+            this.privateKey = privateKey;
+            this.certificateChain = certificateChain;
+        }
+    }
+
+    private static class FixedClientCertificateKeyManager implements X509KeyManager {
+
+        private static final String ALIAS = "inappbrowser-client-cert";
+        private final ClientCertificateIdentity identity;
+
+        private FixedClientCertificateKeyManager(ClientCertificateIdentity identity) {
+            this.identity = identity;
+        }
+
+        @Override
+        public String[] getClientAliases(String keyType, Principal[] issuers) {
+            return shouldUseIdentity(keyType) ? new String[] { ALIAS } : null;
+        }
+
+        @Override
+        public String chooseClientAlias(String[] keyTypes, Principal[] issuers, java.net.Socket socket) {
+            if (keyTypes == null) {
+                return ALIAS;
+            }
+
+            for (String keyType : keyTypes) {
+                if (shouldUseIdentity(keyType)) {
+                    return ALIAS;
+                }
+            }
+
+            return null;
+        }
+
+        @Override
+        public String[] getServerAliases(String keyType, Principal[] issuers) {
+            return null;
+        }
+
+        @Override
+        public String chooseServerAlias(String keyType, Principal[] issuers, java.net.Socket socket) {
+            return null;
+        }
+
+        @Override
+        public X509Certificate[] getCertificateChain(String alias) {
+            return ALIAS.equals(alias) ? identity.certificateChain : null;
+        }
+
+        @Override
+        public PrivateKey getPrivateKey(String alias) {
+            return ALIAS.equals(alias) ? identity.privateKey : null;
+        }
+
+        private boolean shouldUseIdentity(String keyType) {
+            if (
+                identity == null ||
+                identity.privateKey == null ||
+                identity.certificateChain == null ||
+                identity.certificateChain.length == 0
+            ) {
+                return false;
+            }
+
+            if (TextUtils.isEmpty(keyType)) {
+                return true;
+            }
+
+            String privateKeyAlgorithm = identity.privateKey.getAlgorithm();
+            return !TextUtils.isEmpty(privateKeyAlgorithm) && privateKeyAlgorithm.equalsIgnoreCase(keyType);
         }
     }
 
@@ -122,7 +324,13 @@ public class WebViewDialog extends Dialog {
     private final WebView capacitorWebView;
     private String instanceId = "";
     private final Map<String, ProxiedRequest> proxiedRequestsHashmap = new HashMap<>();
+    private ProxyBridge proxyBridge;
+    private String proxyBridgeScript;
+    private String proxyAccessToken;
     private final ExecutorService executorService = Executors.newCachedThreadPool();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Map<String, BlobDownloadSession> blobDownloadSessions = new ConcurrentHashMap<>();
+    private final Map<String, ClientCertificateIdentity> clientCertificateIdentities = new ConcurrentHashMap<>();
     private int iconColor = Color.BLACK; // Default icon color
     private boolean isHiddenModeActive = false;
     private WindowManager.LayoutParams previousWindowAttributes;
@@ -153,6 +361,8 @@ public class WebViewDialog extends Dialog {
         void handleMicrophonePermissionRequest(PermissionRequest request);
 
         void clearPendingPermissionRequest(PermissionRequest request);
+
+        boolean createManagedPopupWindow(WebViewDialog parentDialog, android.os.Message resultMsg, boolean isUserGesture, String popupUrl);
     }
 
     private final PermissionHandler permissionHandler;
@@ -174,6 +384,14 @@ public class WebViewDialog extends Dialog {
 
     public String getInstanceId() {
         return instanceId;
+    }
+
+    public Options getOptions() {
+        return _options;
+    }
+
+    public WebView getManagedWebView() {
+        return _webView;
     }
 
     private void resolveOpenWebViewIfNeeded() {
@@ -317,6 +535,201 @@ public class WebViewDialog extends Dialog {
                 }
             );
         }
+
+        @JavascriptInterface
+        public void handleBlobDownload(String payload) {
+            if (_options == null || !_options.getHandleDownloads()) {
+                return;
+            }
+
+            executorService.execute(() -> {
+                try {
+                    JSONObject jsonPayload = parseBridgePayload(payload, "Blob download payload is missing");
+                    String base64 = jsonPayload.optString("base64", "");
+                    if (TextUtils.isEmpty(base64)) {
+                        throw new IOException("Blob download payload is empty");
+                    }
+
+                    long declaredSize = jsonPayload.optLong("size", -1L);
+                    long estimatedSize = estimateDecodedByteCount(base64);
+                    long decodedSize = declaredSize >= 0 ? Math.max(declaredSize, estimatedSize) : estimatedSize;
+                    if (decodedSize > MAX_LEGACY_BLOB_DOWNLOAD_BYTES) {
+                        throw new IOException("Blob download is too large for the legacy bridge");
+                    }
+
+                    String fileName = sanitizeFileName(jsonPayload.optString("fileName", "download"));
+                    String sourceUrl = jsonPayload.optString("sourceUrl", null);
+                    String mimeType = normalizeMimeType(jsonPayload.optString("mimeType", null), fileName);
+                    File outputFile = null;
+
+                    try {
+                        outputFile = createDownloadFile(fileName);
+                        try (FileOutputStream outputStream = new FileOutputStream(outputFile)) {
+                            outputStream.write(Base64.decode(base64, Base64.DEFAULT));
+                        }
+
+                        finalizeDownload(outputFile, mimeType, sourceUrl);
+                    } catch (Exception innerException) {
+                        if (outputFile != null && outputFile.exists() && !outputFile.delete()) {
+                            outputFile.deleteOnExit();
+                        }
+                        throw innerException;
+                    }
+                } catch (Exception exception) {
+                    showDownloadError("Failed to save blob download", exception);
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void startBlobDownload(String payload) {
+            if (_options == null || !_options.getHandleDownloads()) {
+                return;
+            }
+
+            try {
+                JSONObject jsonPayload = parseBridgePayload(payload, "Blob download start payload is missing");
+                String sessionId = jsonPayload.optString("sessionId", "");
+                if (TextUtils.isEmpty(sessionId)) {
+                    throw new IOException("Blob download session id is missing");
+                }
+
+                String fileName = sanitizeFileName(jsonPayload.optString("fileName", "download"));
+                String sourceUrl = jsonPayload.optString("sourceUrl", null);
+                String mimeType = normalizeMimeType(jsonPayload.optString("mimeType", null), fileName);
+                long expectedSize = jsonPayload.optLong("size", -1L);
+                File outputFile = createDownloadFile(fileName);
+                BlobDownloadSession session = new BlobDownloadSession(
+                    outputFile,
+                    sourceUrl,
+                    mimeType,
+                    new FileOutputStream(outputFile),
+                    expectedSize
+                );
+
+                BlobDownloadSession existingSession = blobDownloadSessions.putIfAbsent(sessionId, session);
+                if (existingSession != null) {
+                    cleanupBlobDownloadSession(session, true);
+                    throw new IOException("Blob download session already exists");
+                }
+            } catch (Exception exception) {
+                showDownloadError("Failed to start blob download", exception);
+            }
+        }
+
+        @JavascriptInterface
+        public void appendBlobDownloadChunk(String payload) {
+            if (_options == null || !_options.getHandleDownloads()) {
+                return;
+            }
+
+            String sessionId = null;
+            try {
+                JSONObject jsonPayload = parseBridgePayload(payload, "Blob download chunk payload is missing");
+                sessionId = jsonPayload.optString("sessionId", "");
+                if (TextUtils.isEmpty(sessionId)) {
+                    throw new IOException("Blob download session id is missing");
+                }
+
+                String base64 = jsonPayload.optString("base64", "");
+                if (TextUtils.isEmpty(base64)) {
+                    return;
+                }
+
+                BlobDownloadSession session = blobDownloadSessions.get(sessionId);
+                if (session == null) {
+                    Log.w("InAppBrowser", "Ignoring chunk for missing or aborted blob session: " + sessionId);
+                    return;
+                }
+
+                byte[] chunkBytes = Base64.decode(base64, Base64.DEFAULT);
+                synchronized (session) {
+                    session.outputStream.write(chunkBytes);
+                    session.bytesWritten += chunkBytes.length;
+                    if (session.expectedSize >= 0 && session.bytesWritten > session.expectedSize) {
+                        throw new IOException("Blob download exceeded expected size");
+                    }
+                }
+            } catch (Exception exception) {
+                abortBlobDownloadSession(sessionId, true);
+                showDownloadError("Failed to save blob download", exception);
+            }
+        }
+
+        @JavascriptInterface
+        public void finishBlobDownload(String payload) {
+            if (_options == null || !_options.getHandleDownloads()) {
+                return;
+            }
+
+            String sessionId = null;
+            try {
+                JSONObject jsonPayload = parseBridgePayload(payload, "Blob download completion payload is missing");
+                sessionId = jsonPayload.optString("sessionId", "");
+                if (TextUtils.isEmpty(sessionId)) {
+                    throw new IOException("Blob download session id is missing");
+                }
+
+                BlobDownloadSession session = blobDownloadSessions.get(sessionId);
+                if (session == null) {
+                    throw new IOException("Blob download session was not initialized");
+                }
+
+                synchronized (session) {
+                    session.outputStream.flush();
+                    session.outputStream.close();
+                }
+
+                if (session.expectedSize >= 0 && session.bytesWritten != session.expectedSize) {
+                    throw new IOException(
+                        "Blob download size mismatch for " +
+                            session.outputFile.getName() +
+                            ": expected " +
+                            session.expectedSize +
+                            ", wrote " +
+                            session.bytesWritten
+                    );
+                }
+
+                finalizeDownload(session.outputFile, session.mimeType, session.sourceUrl);
+                blobDownloadSessions.remove(sessionId);
+            } catch (Exception exception) {
+                abortBlobDownloadSession(sessionId, true);
+                showDownloadError("Failed to finalize blob download", exception);
+            }
+        }
+
+        @JavascriptInterface
+        public void abortBlobDownload(String payload) {
+            if (_options == null || !_options.getHandleDownloads()) {
+                return;
+            }
+
+            String sessionId = null;
+            String reason = "Blob download aborted";
+            String sourceUrl = null;
+            String fileName = null;
+            String mimeType = null;
+            try {
+                JSONObject jsonPayload = parseBridgePayload(payload, "Blob download abort payload is missing");
+                sessionId = jsonPayload.optString("sessionId", "");
+                if (!TextUtils.isEmpty(jsonPayload.optString("reason", ""))) {
+                    reason = jsonPayload.optString("reason", reason);
+                }
+                sourceUrl = jsonPayload.optString("sourceUrl", null);
+                fileName = jsonPayload.optString("fileName", null);
+                mimeType = jsonPayload.optString("mimeType", null);
+            } catch (Exception ignored) {}
+
+            BlobDownloadSession session = abortBlobDownloadSession(sessionId, true);
+            notifyDownloadFailed(
+                session != null ? session.sourceUrl : sourceUrl,
+                session != null ? session.outputFile.getName() : fileName,
+                session != null ? session.mimeType : mimeType,
+                reason
+            );
+            Log.w("InAppBrowser", reason);
+        }
     }
 
     public interface ScreenshotResultCallback {
@@ -340,6 +753,909 @@ public class WebViewDialog extends Dialog {
         }
         String upperMethod = method.toUpperCase();
         return upperMethod.equals("POST") || upperMethod.equals("PUT") || upperMethod.equals("PATCH");
+    }
+
+    private String sanitizeFileName(String fileName) {
+        if (TextUtils.isEmpty(fileName)) {
+            return "download";
+        }
+
+        String sanitized = fileName.replaceAll("[\\\\/:*?\"<>|]", "_").trim();
+        return sanitized.isEmpty() ? "download" : sanitized;
+    }
+
+    private String fileExtension(String fileName) {
+        int lastDotIndex = fileName.lastIndexOf('.');
+        if (lastDotIndex < 0 || lastDotIndex == fileName.length() - 1) {
+            return "";
+        }
+        return fileName.substring(lastDotIndex + 1).toLowerCase();
+    }
+
+    private String normalizeMimeType(String mimeType, String fileName) {
+        if (!TextUtils.isEmpty(mimeType)) {
+            String normalized = mimeType.split(";")[0].trim().toLowerCase();
+            if (!TextUtils.isEmpty(normalized)) {
+                return normalized;
+            }
+        }
+
+        String guessedType = URLConnection.guessContentTypeFromName(fileName);
+        if (!TextUtils.isEmpty(guessedType)) {
+            return guessedType.toLowerCase();
+        }
+
+        String extension = fileExtension(fileName);
+        if ("pdf".equals(extension)) {
+            return "application/pdf";
+        }
+        if ("json".equals(extension)) {
+            return "application/json";
+        }
+
+        return "application/octet-stream";
+    }
+
+    private boolean isTextPreviewMimeType(String mimeType) {
+        if (TextUtils.isEmpty(mimeType)) {
+            return false;
+        }
+
+        return (
+            mimeType.startsWith("text/") ||
+            "application/json".equals(mimeType) ||
+            "application/javascript".equals(mimeType) ||
+            "application/xhtml+xml".equals(mimeType) ||
+            "image/svg+xml".equals(mimeType)
+        );
+    }
+
+    private File downloadDirectory() throws IOException {
+        File directory = new File(_context.getCacheDir(), "inappbrowser-downloads");
+        if (!directory.exists() && !directory.mkdirs()) {
+            throw new IOException("Could not create download directory");
+        }
+        return directory;
+    }
+
+    private File createDownloadFile(String fileName) throws IOException {
+        String sanitizedFileName = sanitizeFileName(fileName);
+        String extension = fileExtension(sanitizedFileName);
+        String baseName = extension.isEmpty()
+            ? sanitizedFileName
+            : sanitizedFileName.substring(0, sanitizedFileName.length() - extension.length() - 1);
+        File directory = downloadDirectory();
+
+        int duplicateIndex = 0;
+        while (true) {
+            String candidateName =
+                duplicateIndex == 0
+                    ? sanitizedFileName
+                    : extension.isEmpty()
+                        ? baseName + "-" + duplicateIndex
+                        : baseName + "-" + duplicateIndex + "." + extension;
+            File candidate = new File(directory, candidateName);
+            if (candidate.createNewFile()) {
+                return candidate;
+            }
+            duplicateIndex++;
+        }
+    }
+
+    private String readUtf8File(File file) throws IOException {
+        try (FileInputStream inputStream = new FileInputStream(file); ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[4096];
+            int bytesRead;
+            while ((bytesRead = inputStream.read(buffer)) != -1) {
+                outputStream.write(buffer, 0, bytesRead);
+            }
+            return new String(outputStream.toByteArray(), StandardCharsets.UTF_8);
+        }
+    }
+
+    private long estimateDecodedByteCount(String base64) {
+        if (TextUtils.isEmpty(base64)) {
+            return 0L;
+        }
+
+        int padding = 0;
+        int length = base64.length();
+        if (length > 0 && base64.charAt(length - 1) == '=') {
+            padding++;
+        }
+        if (length > 1 && base64.charAt(length - 2) == '=') {
+            padding++;
+        }
+        return ((long) length * 3L) / 4L - padding;
+    }
+
+    private JSONObject parseBridgePayload(String payload, String errorMessage) throws JSONException {
+        if (TextUtils.isEmpty(payload)) {
+            throw new JSONException(errorMessage);
+        }
+        return new JSONObject(payload);
+    }
+
+    private void cleanupBlobDownloadSession(BlobDownloadSession session, boolean deleteFile) {
+        if (session == null) {
+            return;
+        }
+
+        synchronized (session) {
+            try {
+                session.outputStream.close();
+            } catch (IOException ignored) {}
+        }
+
+        if (deleteFile && session.outputFile.exists() && !session.outputFile.delete()) {
+            session.outputFile.deleteOnExit();
+        }
+    }
+
+    private BlobDownloadSession abortBlobDownloadSession(String sessionId, boolean deleteFile) {
+        if (TextUtils.isEmpty(sessionId)) {
+            return null;
+        }
+
+        BlobDownloadSession session = blobDownloadSessions.remove(sessionId);
+        cleanupBlobDownloadSession(session, deleteFile);
+        return session;
+    }
+
+    private String textPreviewHtml(File file, String bodyText) {
+        String fileName = TextUtils.htmlEncode(file.getName());
+        String escapedBody = TextUtils.htmlEncode(bodyText);
+
+        return String.format(
+            """
+            <!doctype html>
+            <html lang="en">
+              <head>
+                <meta charset="UTF-8" />
+                <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+                <title>%s</title>
+                <style>
+                  body {
+                    margin: 0;
+                    min-height: 100vh;
+                    padding: 24px;
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                    background: linear-gradient(180deg, #f8fafc 0%%, #e2e8f0 100%%);
+                    color: #0f172a;
+                  }
+                  main {
+                    max-width: 720px;
+                    margin: 0 auto;
+                    background: rgba(255, 255, 255, 0.94);
+                    border-radius: 20px;
+                    padding: 24px;
+                    box-shadow: 0 20px 48px rgba(15, 23, 42, 0.12);
+                  }
+                  h1 {
+                    margin: 0 0 16px;
+                    font-size: 1.2rem;
+                  }
+                  pre {
+                    margin: 0;
+                    white-space: pre-wrap;
+                    word-break: break-word;
+                    font-size: 1rem;
+                    line-height: 1.6;
+                  }
+                </style>
+              </head>
+              <body>
+                <main>
+                  <h1>%s</h1>
+                  <pre>%s</pre>
+                </main>
+              </body>
+            </html>
+            """,
+            fileName,
+            fileName,
+            escapedBody
+        );
+    }
+
+    private void notifyDownloadCompleted(File file, String mimeType, String sourceUrl, String handledBy) {
+        if (_options == null || _options.getCallbacks() == null) {
+            return;
+        }
+
+        _options
+            .getCallbacks()
+            .downloadCompleted(sourceUrl, file.getName(), mimeType, file.getAbsolutePath(), Uri.fromFile(file).toString(), handledBy);
+    }
+
+    private void notifyDownloadFailed(String sourceUrl, String fileName, String mimeType, String error) {
+        if (_options == null || _options.getCallbacks() == null) {
+            return;
+        }
+
+        _options.getCallbacks().downloadFailed(sourceUrl, fileName, mimeType, error);
+    }
+
+    private String downloadErrorMessage(String message, Exception exception) {
+        if (exception == null || TextUtils.isEmpty(exception.getMessage())) {
+            return message;
+        }
+        return message + ": " + exception.getMessage();
+    }
+
+    private int normalizedPort(String scheme, int port) {
+        if (port >= 0) {
+            return port;
+        }
+        if ("https".equalsIgnoreCase(scheme)) {
+            return 443;
+        }
+        if ("http".equalsIgnoreCase(scheme)) {
+            return 80;
+        }
+        return -1;
+    }
+
+    private String clientCertificateIdentityKey(String host, int port, String scheme) {
+        if (TextUtils.isEmpty(host)) {
+            return null;
+        }
+        return host.toLowerCase(Locale.ROOT) + ":" + normalizedPort(scheme, port);
+    }
+
+    private String clientCertificateIdentityKey(URL url) {
+        if (url == null) {
+            return null;
+        }
+        return clientCertificateIdentityKey(url.getHost(), url.getPort(), url.getProtocol());
+    }
+
+    private boolean isSameOrigin(String firstUrl, String secondUrl) {
+        if (TextUtils.isEmpty(firstUrl) || TextUtils.isEmpty(secondUrl)) {
+            return false;
+        }
+
+        try {
+            URI firstUri = new URI(firstUrl);
+            URI secondUri = new URI(secondUrl);
+            String firstHost = firstUri.getHost();
+            String secondHost = secondUri.getHost();
+            if (firstHost == null || secondHost == null) {
+                return false;
+            }
+
+            return (
+                Objects.equals(firstUri.getScheme(), secondUri.getScheme()) &&
+                firstHost.equalsIgnoreCase(secondHost) &&
+                normalizedPort(firstUri.getScheme(), firstUri.getPort()) == normalizedPort(secondUri.getScheme(), secondUri.getPort())
+            );
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private boolean shouldBlockManagedDownload(String url) {
+        if (_options == null) {
+            return false;
+        }
+
+        return shouldBlockHost(url, _options.getBlockedHosts());
+    }
+
+    private boolean shouldBlockHost(String url, List<String> blockedHosts) {
+        Uri uri = Uri.parse(url);
+        String host = uri.getHost();
+
+        if (host == null || host.isEmpty()) {
+            return false;
+        }
+
+        if (blockedHosts == null || blockedHosts.isEmpty()) {
+            return false;
+        }
+
+        String normalizedHost = host.toLowerCase(Locale.US);
+        for (String blockPattern : blockedHosts) {
+            if (blockPattern != null && matchesBlockPattern(normalizedHost, blockPattern.toLowerCase(Locale.US))) {
+                Log.d("InAppBrowser", "Blocked managed download host detected: " + host);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private boolean matchesBlockPattern(String host, String pattern) {
+        if (pattern == null || pattern.isEmpty()) {
+            return false;
+        }
+
+        if (host.equals(pattern)) {
+            return true;
+        }
+
+        if (!pattern.contains("*")) {
+            return false;
+        }
+
+        if (pattern.startsWith("*.")) {
+            return matchesWildcardDomain(host, pattern);
+        } else if (pattern.contains("*")) {
+            return matchesRegexPattern(host, pattern);
+        }
+
+        return false;
+    }
+
+    private boolean matchesWildcardDomain(String host, String pattern) {
+        String domain = pattern.substring(2);
+        if (domain.isEmpty()) {
+            return false;
+        }
+
+        return host.equals(domain) || host.endsWith("." + domain);
+    }
+
+    private boolean matchesRegexPattern(String host, String pattern) {
+        try {
+            String escapedPattern = pattern
+                .replace("\\", "\\\\")
+                .replace(".", "\\.")
+                .replace("+", "\\+")
+                .replace("?", "\\?")
+                .replace("^", "\\^")
+                .replace("$", "\\$")
+                .replace("(", "\\(")
+                .replace(")", "\\)")
+                .replace("[", "\\[")
+                .replace("]", "\\]")
+                .replace("{", "\\{")
+                .replace("}", "\\}")
+                .replace("|", "\\|");
+            String regexPattern = "^" + escapedPattern.replace("*", ".*") + "$";
+            return Pattern.matches(regexPattern, host);
+        } catch (Exception exception) {
+            Log.e("InAppBrowser", "Invalid blocked host pattern '" + pattern + "': " + exception.getMessage());
+            return false;
+        }
+    }
+
+    private boolean shouldForwardCustomDownloadHeader(String headerKey) {
+        if (TextUtils.isEmpty(headerKey)) {
+            return false;
+        }
+
+        return !("cookie".equalsIgnoreCase(headerKey) || "proxy-authorization".equalsIgnoreCase(headerKey));
+    }
+
+    private String redactUrlForLogging(String rawUrl) {
+        if (TextUtils.isEmpty(rawUrl)) {
+            return rawUrl;
+        }
+
+        try {
+            Uri parsedUrl = Uri.parse(rawUrl);
+            return parsedUrl.buildUpon().encodedQuery(null).encodedFragment(null).build().toString();
+        } catch (Exception exception) {
+            return rawUrl;
+        }
+    }
+
+    private void configureDownloadTlsIfNeeded(HttpURLConnection connection, URL downloadUrl) throws Exception {
+        if (!(connection instanceof HttpsURLConnection)) {
+            return;
+        }
+
+        ClientCertificateIdentity clientCertificateIdentity = clientCertificateIdentities.get(clientCertificateIdentityKey(downloadUrl));
+        boolean ignoreUntrustedSslError = _options != null && _options.ignoreUntrustedSSLError();
+        if (clientCertificateIdentity == null && !ignoreUntrustedSslError) {
+            return;
+        }
+
+        KeyManager[] keyManagers =
+            clientCertificateIdentity != null ? new KeyManager[] { new FixedClientCertificateKeyManager(clientCertificateIdentity) } : null;
+
+        X509TrustManager defaultTrustManager = ignoreUntrustedSslError ? createDefaultTrustManager() : null;
+        TrustManager[] trustManagers = ignoreUntrustedSslError
+            ? new TrustManager[] {
+                  new X509TrustManager() {
+                      @Override
+                      public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+                          defaultTrustManager.checkClientTrusted(chain, authType);
+                      }
+
+                      @Override
+                      public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+                          try {
+                              defaultTrustManager.checkServerTrusted(chain, authType);
+                          } catch (CertificateException certificateException) {
+                              if (!shouldBypassDownloadTrustFailure(certificateException, chain)) {
+                                  throw certificateException;
+                              }
+                              Log.w(
+                                  "InAppBrowser",
+                                  "Ignoring untrusted download certificate for " + redactUrlForLogging(downloadUrl.toString())
+                              );
+                          }
+                      }
+
+                      @Override
+                      public X509Certificate[] getAcceptedIssuers() {
+                          return defaultTrustManager.getAcceptedIssuers();
+                      }
+                  }
+              }
+            : null;
+        SSLContext sslContext = SSLContext.getInstance("TLS");
+        sslContext.init(keyManagers, trustManagers, new SecureRandom());
+
+        HttpsURLConnection secureConnection = (HttpsURLConnection) connection;
+        secureConnection.setSSLSocketFactory(sslContext.getSocketFactory());
+    }
+
+    private X509TrustManager createDefaultTrustManager() throws GeneralSecurityException {
+        TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        trustManagerFactory.init((java.security.KeyStore) null);
+        for (TrustManager trustManager : trustManagerFactory.getTrustManagers()) {
+            if (trustManager instanceof X509TrustManager) {
+                return (X509TrustManager) trustManager;
+            }
+        }
+        throw new GeneralSecurityException("No default X509TrustManager available");
+    }
+
+    private boolean shouldBypassDownloadTrustFailure(CertificateException certificateException, X509Certificate[] chain) {
+        return areCertificatesCurrentlyValid(chain) && isUntrustedIssuerFailure(certificateException);
+    }
+
+    private boolean areCertificatesCurrentlyValid(X509Certificate[] chain) {
+        if (chain == null || chain.length == 0) {
+            return false;
+        }
+
+        for (X509Certificate certificate : chain) {
+            if (certificate == null) {
+                return false;
+            }
+
+            try {
+                certificate.checkValidity();
+            } catch (CertificateExpiredException | CertificateNotYetValidException certificateValidityException) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private boolean isUntrustedIssuerFailure(Throwable throwable) {
+        Throwable current = throwable;
+        while (current != null) {
+            if (current instanceof CertificateExpiredException || current instanceof CertificateNotYetValidException) {
+                return false;
+            }
+            if (current instanceof CertPathValidatorException) {
+                CertPathValidatorException validatorException = (CertPathValidatorException) current;
+                CertPathValidatorException.Reason reason = validatorException.getReason();
+                if (
+                    reason == CertPathValidatorException.BasicReason.EXPIRED ||
+                    reason == CertPathValidatorException.BasicReason.NOT_YET_VALID ||
+                    reason == CertPathValidatorException.BasicReason.REVOKED ||
+                    reason == CertPathValidatorException.BasicReason.INVALID_SIGNATURE ||
+                    reason == CertPathValidatorException.BasicReason.ALGORITHM_CONSTRAINED
+                ) {
+                    return false;
+                }
+            }
+
+            String message = current.getMessage();
+            if (!TextUtils.isEmpty(message)) {
+                String normalizedMessage = message.toLowerCase(Locale.US);
+                if (
+                    normalizedMessage.contains("trust anchor for certification path not found") ||
+                    normalizedMessage.contains("unable to find valid certification path") ||
+                    normalizedMessage.contains("trust anchor")
+                ) {
+                    return true;
+                }
+                if (
+                    normalizedMessage.contains("certificate expired") ||
+                    normalizedMessage.contains("not yet valid") ||
+                    normalizedMessage.contains("certificate revoked") ||
+                    normalizedMessage.contains("revoked")
+                ) {
+                    return false;
+                }
+            }
+
+            current = current.getCause();
+        }
+
+        return false;
+    }
+
+    private void previewDownloadedFileInWebView(File file, String mimeType, String sourceUrl) {
+        WebView webView = _webView;
+        if (webView == null || isDismissing) {
+            openDownloadedFile(file, mimeType, sourceUrl);
+            return;
+        }
+
+        if (!isTextPreviewMimeType(mimeType)) {
+            openDownloadedFile(file, mimeType, sourceUrl);
+            return;
+        }
+
+        if (file.length() > MAX_INLINE_TEXT_PREVIEW_BYTES) {
+            Log.i("InAppBrowser", "Opening large text download externally: " + file.getName());
+            openDownloadedFile(file, mimeType, sourceUrl);
+            return;
+        }
+
+        executorService.execute(() -> {
+            try {
+                String previewHtml = textPreviewHtml(file, readUtf8File(file));
+                mainHandler.post(() -> {
+                    if (isDismissing || _webView == null || _webView != webView) {
+                        openDownloadedFile(file, mimeType, sourceUrl);
+                        return;
+                    }
+
+                    webView.loadDataWithBaseURL("https://download-preview.local/", previewHtml, "text/html", "utf-8", null);
+                    notifyDownloadCompleted(file, mimeType, sourceUrl, "inAppBrowser");
+                });
+            } catch (IOException ioException) {
+                showDownloadError("Failed to preview downloaded text file", ioException, sourceUrl, file.getName(), mimeType);
+            }
+        });
+    }
+
+    private void openDownloadedFile(File file, String mimeType, String sourceUrl) {
+        try {
+            Uri fileUri = FileProvider.getUriForFile(_context, _context.getPackageName() + ".fileprovider", file);
+            Intent intent = new Intent(Intent.ACTION_VIEW);
+            intent.setDataAndType(fileUri, mimeType);
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+            _context.startActivity(intent);
+            notifyDownloadCompleted(file, mimeType, sourceUrl, "external");
+        } catch (ActivityNotFoundException activityNotFoundException) {
+            showDownloadError("No app can open " + file.getName(), activityNotFoundException, sourceUrl, file.getName(), mimeType);
+        } catch (Exception exception) {
+            showDownloadError("Failed to open " + file.getName(), exception, sourceUrl, file.getName(), mimeType);
+        }
+    }
+
+    private void finalizeDownload(File outputFile, String mimeType, String sourceUrl) {
+        mainHandler.post(() -> {
+            if (isTextPreviewMimeType(mimeType) && _webView != null) {
+                previewDownloadedFileInWebView(outputFile, mimeType, sourceUrl);
+                return;
+            }
+
+            openDownloadedFile(outputFile, mimeType, sourceUrl);
+        });
+    }
+
+    private void showDownloadError(String message, Exception exception) {
+        showDownloadError(message, exception, null, null, null);
+    }
+
+    private void showDownloadError(String message, Exception exception, String sourceUrl, String fileName, String mimeType) {
+        Log.e("InAppBrowser", message, exception);
+        notifyDownloadFailed(sourceUrl, fileName, mimeType, downloadErrorMessage(message, exception));
+        mainHandler.post(() -> Toast.makeText(_context, message, Toast.LENGTH_SHORT).show());
+    }
+
+    private String currentManagedDownloadPageUrl() {
+        if (_webView != null && !TextUtils.isEmpty(_webView.getUrl())) {
+            return _webView.getUrl();
+        }
+
+        return _options != null ? _options.getUrl() : null;
+    }
+
+    private HttpURLConnection openManagedDownloadConnection(String url, String userAgent, String pageUrl) throws Exception {
+        URL downloadUrl = new URL(url);
+        HttpURLConnection connection = (HttpURLConnection) downloadUrl.openConnection();
+        configureDownloadTlsIfNeeded(connection, downloadUrl);
+        connection.setConnectTimeout(REQUEST_CONNECT_TIMEOUT_MS);
+        connection.setReadTimeout(REQUEST_READ_TIMEOUT_MS);
+        connection.setInstanceFollowRedirects(false);
+        connection.setRequestProperty("Accept", "*/*");
+
+        if (!TextUtils.isEmpty(userAgent)) {
+            connection.setRequestProperty("User-Agent", userAgent);
+        }
+
+        String cookie = android.webkit.CookieManager.getInstance().getCookie(url);
+        if (!TextUtils.isEmpty(cookie)) {
+            connection.setRequestProperty("Cookie", cookie);
+        }
+
+        if (!TextUtils.isEmpty(pageUrl)) {
+            connection.setRequestProperty("Referer", pageUrl);
+        }
+
+        if (_options != null && _options.getHeaders() != null) {
+            if (isSameOrigin(pageUrl, url)) {
+                Iterator<String> headerKeys = _options.getHeaders().keys();
+                while (headerKeys.hasNext()) {
+                    String headerKey = headerKeys.next();
+                    if (!shouldForwardCustomDownloadHeader(headerKey)) {
+                        continue;
+                    }
+
+                    String headerValue = _options.getHeaders().getString(headerKey);
+                    if (!TextUtils.isEmpty(headerValue)) {
+                        connection.setRequestProperty(headerKey, headerValue);
+                    }
+                }
+            } else {
+                Log.w("InAppBrowser", "Skipping custom headers for cross-origin download: " + redactUrlForLogging(url));
+            }
+        }
+
+        return connection;
+    }
+
+    private boolean isManagedDownloadRedirect(int responseCode) {
+        return (
+            responseCode == HttpURLConnection.HTTP_MOVED_PERM ||
+            responseCode == HttpURLConnection.HTTP_MOVED_TEMP ||
+            responseCode == HttpURLConnection.HTTP_SEE_OTHER ||
+            responseCode == 307 ||
+            responseCode == 308
+        );
+    }
+
+    private String resolveManagedDownloadRedirectUrl(HttpURLConnection connection) throws IOException {
+        String location = connection.getHeaderField("Location");
+        if (TextUtils.isEmpty(location)) {
+            throw new IOException("Managed download redirect missing Location header");
+        }
+
+        return new URL(connection.getURL(), location).toString();
+    }
+
+    private void persistManagedDownloadResponseCookies(HttpURLConnection connection, String requestUrl) {
+        if (connection == null || TextUtils.isEmpty(requestUrl)) {
+            return;
+        }
+
+        ProxyRequestSupport.ParsedResponseHeaders parsedHeaders = ProxyRequestSupport.splitResponseHeaders(connection.getHeaderFields());
+        applyResponseCookies(requestUrl, parsedHeaders.cookieHeaders());
+    }
+
+    private void downloadUrlToFile(String url, String userAgent, String contentDisposition, String mimeType) {
+        executorService.execute(() -> {
+            HttpURLConnection connection = null;
+            InputStream inputStream = null;
+            File outputFile = null;
+            boolean downloadSucceeded = false;
+
+            try {
+                String pageUrl = currentManagedDownloadPageUrl();
+                String currentUrl = url;
+                int redirectsFollowed = 0;
+                while (true) {
+                    if (shouldBlockManagedDownload(currentUrl)) {
+                        throw new SecurityException("Download blocked for URL: " + redactUrlForLogging(currentUrl));
+                    }
+
+                    connection = openManagedDownloadConnection(currentUrl, userAgent, pageUrl);
+                    connection.connect();
+
+                    int responseCode = connection.getResponseCode();
+                    persistManagedDownloadResponseCookies(connection, currentUrl);
+                    if (!isManagedDownloadRedirect(responseCode)) {
+                        break;
+                    }
+
+                    if (redirectsFollowed >= MAX_MANAGED_DOWNLOAD_REDIRECTS) {
+                        throw new IOException("Too many managed download redirects for: " + redactUrlForLogging(url));
+                    }
+
+                    String redirectUrl = resolveManagedDownloadRedirectUrl(connection);
+                    if (shouldBlockManagedDownload(redirectUrl)) {
+                        throw new SecurityException("Download blocked for URL: " + redactUrlForLogging(redirectUrl));
+                    }
+
+                    connection.disconnect();
+                    connection = null;
+                    currentUrl = redirectUrl;
+                    redirectsFollowed++;
+                }
+
+                int responseCode = connection.getResponseCode();
+                if (responseCode < 200 || responseCode >= 300) {
+                    String responseMessage = connection.getResponseMessage();
+                    throw new IOException(
+                        "Download request failed with HTTP " +
+                            responseCode +
+                            (TextUtils.isEmpty(responseMessage) ? "" : " " + responseMessage)
+                    );
+                }
+
+                String resolvedDisposition = connection.getHeaderField("Content-Disposition");
+                if (TextUtils.isEmpty(resolvedDisposition)) {
+                    resolvedDisposition = contentDisposition;
+                }
+
+                String provisionalMimeType = connection.getContentType();
+                if (TextUtils.isEmpty(provisionalMimeType)) {
+                    provisionalMimeType = mimeType;
+                }
+
+                String fileName = URLUtil.guessFileName(connection.getURL().toString(), resolvedDisposition, provisionalMimeType);
+                String resolvedMimeType = normalizeMimeType(provisionalMimeType, fileName);
+                outputFile = createDownloadFile(fileName);
+
+                inputStream = connection.getInputStream();
+                try (FileOutputStream outputStream = new FileOutputStream(outputFile)) {
+                    byte[] buffer = new byte[8192];
+                    int bytesRead;
+                    while ((bytesRead = inputStream.read(buffer)) != -1) {
+                        outputStream.write(buffer, 0, bytesRead);
+                    }
+                }
+
+                finalizeDownload(outputFile, resolvedMimeType, url);
+                downloadSucceeded = true;
+            } catch (Exception exception) {
+                showDownloadError("Failed to download file", exception, url, null, mimeType);
+            } finally {
+                if (inputStream != null) {
+                    try {
+                        inputStream.close();
+                    } catch (IOException ignored) {}
+                }
+                if (connection != null) {
+                    connection.disconnect();
+                }
+                if (!downloadSucceeded && outputFile != null && outputFile.exists() && !outputFile.delete()) {
+                    outputFile.deleteOnExit();
+                }
+            }
+        });
+    }
+
+    private void handleBlobDownloadFromPage(String blobUrl, String mimeType, String contentDisposition) {
+        if (_webView == null) {
+            showDownloadError(
+                "Blob download requires an active WebView",
+                new IllegalStateException("WebView not initialized"),
+                blobUrl,
+                null,
+                mimeType
+            );
+            return;
+        }
+
+        String fallbackMimeType = normalizeMimeType(mimeType, "download");
+        String fallbackFileName = URLUtil.guessFileName("download", contentDisposition, fallbackMimeType);
+        String script = String.format(
+            """
+            (() => {
+              const blobUrl = %s;
+              const fallbackMimeType = %s;
+              const fallbackFileName = %s;
+              const legacyMaxBytes = %d;
+              const chunkSize = %d;
+              const matchingLink = Array.from(document.querySelectorAll('a[download]')).find(link => link.href === blobUrl);
+              const bridge = (window.mobileApp && window.mobileApp.startBlobDownload && window.mobileApp.appendBlobDownloadChunk && window.mobileApp.finishBlobDownload)
+                ? window.mobileApp
+                : (window.AndroidInterface && window.AndroidInterface.startBlobDownload && window.AndroidInterface.appendBlobDownloadChunk && window.AndroidInterface.finishBlobDownload)
+                  ? window.AndroidInterface
+                  : (window.mobileApp && window.mobileApp.handleBlobDownload)
+                    ? window.mobileApp
+                    : (window.AndroidInterface && window.AndroidInterface.handleBlobDownload)
+                      ? window.AndroidInterface
+                      : null;
+              const sessionId = `blob-download-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+              let fileName = fallbackFileName;
+              const readChunkAsBase64 = chunk => new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onloadend = function() {
+                  const dataUrl = reader.result || '';
+                  resolve(String(dataUrl).split(',').pop() || '');
+                };
+                reader.onerror = function() {
+                  reject(reader.error || new Error('Failed to read blob chunk'));
+                };
+                reader.readAsDataURL(chunk);
+              });
+
+              return (async function() {
+                if (!bridge) {
+                  throw new Error('Blob download bridge is not available');
+                }
+
+                const response = await fetch(blobUrl);
+                const blob = await response.blob();
+                fileName = (matchingLink && matchingLink.getAttribute('download')) || fallbackFileName;
+
+                if (bridge.startBlobDownload && bridge.appendBlobDownloadChunk && bridge.finishBlobDownload) {
+                  bridge.startBlobDownload(JSON.stringify({
+                    sessionId,
+                    fileName,
+                    sourceUrl: blobUrl,
+                    mimeType: blob.type || fallbackMimeType,
+                    size: blob.size
+                  }));
+                  for (let offset = 0; offset < blob.size; offset += chunkSize) {
+                    const base64 = await readChunkAsBase64(blob.slice(offset, offset + chunkSize));
+                    bridge.appendBlobDownloadChunk(JSON.stringify({ sessionId, base64 }));
+                  }
+                  bridge.finishBlobDownload(JSON.stringify({ sessionId }));
+                  return;
+                }
+
+                if (blob.size > legacyMaxBytes) {
+                  throw new Error('Blob download is too large for the legacy bridge');
+                }
+
+                const base64 = await readChunkAsBase64(blob);
+                bridge.handleBlobDownload(JSON.stringify({
+                  fileName,
+                  sourceUrl: blobUrl,
+                  mimeType: blob.type || fallbackMimeType,
+                  size: blob.size,
+                  base64
+                }));
+              })().catch(error => {
+              if (bridge && bridge.abortBlobDownload) {
+                bridge.abortBlobDownload(JSON.stringify({
+                  sessionId,
+                  fileName,
+                  sourceUrl: blobUrl,
+                  mimeType: fallbackMimeType,
+                  reason: String((error && error.message) || error || 'Blob download failed')
+                }));
+              }
+              console.error('Failed to capture blob download', error);
+            });
+            })();
+            """,
+            JSONObject.quote(blobUrl),
+            JSONObject.quote(fallbackMimeType),
+            JSONObject.quote(fallbackFileName),
+            MAX_LEGACY_BLOB_DOWNLOAD_BYTES,
+            BLOB_DOWNLOAD_CHUNK_BYTES
+        );
+
+        final WebView webView = _webView;
+        webView.post(() -> {
+            if (isDismissing || _webView == null || _webView != webView) {
+                Log.w("InAppBrowser", "Skipping blob download bridge dispatch because the WebView is no longer available");
+                return;
+            }
+
+            webView.evaluateJavascript(script, null);
+        });
+    }
+
+    private void handleDownloadRequest(String url, String userAgent, String contentDisposition, String mimeType) {
+        if (_options == null || !_options.getHandleDownloads() || TextUtils.isEmpty(url)) {
+            return;
+        }
+
+        if (shouldBlockManagedDownload(url)) {
+            showDownloadError(
+                "Blocked download URL",
+                new SecurityException("Download blocked for URL: " + redactUrlForLogging(url)),
+                url,
+                null,
+                mimeType
+            );
+            return;
+        }
+
+        if (url.startsWith("blob:")) {
+            handleBlobDownloadFromPage(url, mimeType, contentDisposition);
+            return;
+        }
+
+        downloadUrlToFile(url, userAgent, contentDisposition, mimeType);
     }
 
     public class PreShowScriptInterface {
@@ -540,10 +1856,17 @@ public class WebViewDialog extends Dialog {
         _webView.addJavascriptInterface(new JavaScriptInterface(), "mobileApp");
         _webView.addJavascriptInterface(new PreShowScriptInterface(), "PreShowScriptInterface");
         _webView.addJavascriptInterface(new PrintInterface(this._context, _webView), "PrintInterface");
+        if (_options.shouldEnableNativeProxy()) {
+            proxyAccessToken = UUID.randomUUID().toString();
+            proxyBridge = new ProxyBridge(proxyAccessToken);
+            _webView.addJavascriptInterface(proxyBridge, "__capgoProxy");
+            proxyBridgeScript = loadProxyBridgeScript();
+        }
         _webView.getSettings().setJavaScriptEnabled(true);
         _webView.getSettings().setJavaScriptCanOpenWindowsAutomatically(true);
         _webView.getSettings().setDatabaseEnabled(true);
         _webView.getSettings().setDomStorageEnabled(true);
+        _webView.getSettings().setAllowContentAccess(true);
         _webView.getSettings().setAllowFileAccess(true);
         _webView.getSettings().setLoadWithOverviewMode(true);
         _webView.getSettings().setUseWideViewPort(true);
@@ -551,9 +1874,11 @@ public class WebViewDialog extends Dialog {
         _webView.getSettings().setAllowUniversalAccessFromFileURLs(true);
         _webView.getSettings().setMediaPlaybackRequiresUserGesture(false);
 
-        // Open links in external browser for target="_blank" if preventDeepLink is false
-        if (!_options.getPreventDeeplink()) {
-            _webView.getSettings().setSupportMultipleWindows(true);
+        _webView.getSettings().setSupportMultipleWindows(true);
+        if (_options.getEnableZoom()) {
+            _webView.getSettings().setSupportZoom(true);
+            _webView.getSettings().setBuiltInZoomControls(true);
+            _webView.getSettings().setDisplayZoomControls(false);
         }
 
         // Enhanced settings for Google Pay and Payment Request API support (only when enabled)
@@ -588,6 +1913,22 @@ public class WebViewDialog extends Dialog {
 
         _webView.setWebChromeClient(
             new WebChromeClient() {
+                @Override
+                public boolean onConsoleMessage(ConsoleMessage consoleMessage) {
+                    if (consoleMessage != null && _options != null && _options.getCaptureConsoleLogs() && _options.getCallbacks() != null) {
+                        _options
+                            .getCallbacks()
+                            .consoleMessage(
+                                consoleMessage.messageLevel().name(),
+                                consoleMessage.message(),
+                                consoleMessage.sourceId(),
+                                consoleMessage.lineNumber(),
+                                null
+                            );
+                    }
+                    return super.onConsoleMessage(consoleMessage);
+                }
+
                 // Enable file open dialog
                 @Override
                 public boolean onShowFileChooser(
@@ -956,7 +2297,6 @@ public class WebViewDialog extends Dialog {
                     }
                 }
 
-                // Support for Google Pay and popup windows (critical for OR_BIBED_15 fix)
                 @Override
                 public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, android.os.Message resultMsg) {
                     Log.d(
@@ -966,75 +2306,75 @@ public class WebViewDialog extends Dialog {
                             ", GooglePaySupport: " +
                             _options.getEnableGooglePaySupport() +
                             ", preventDeeplink: " +
-                            _options.getPreventDeeplink()
+                            _options.getPreventDeeplink() +
+                            ", openBlankTargetInWebView: " +
+                            _options.getOpenBlankTargetInWebView()
                     );
 
-                    // When preventDeeplink is false, open target="_blank" links externally
+                    WebView.HitTestResult result = view.getHitTestResult();
+                    String data = result != null ? result.getExtra() : null;
+
+                    if (shouldLoadBlankTargetInCurrentWebView(data)) {
+                        Log.d("InAppBrowser", "Loading target=_blank link in current WebView: " + data);
+                        view.post(() -> _webView.loadUrl(data));
+                        return false;
+                    }
+
+                    String popupUrl = null;
+                    try {
+                        WebView.HitTestResult hitTestResult = view.getHitTestResult();
+                        popupUrl = hitTestResult != null ? hitTestResult.getExtra() : null;
+                    } catch (Exception ignored) {}
+
+                    if (
+                        permissionHandler != null &&
+                        permissionHandler.createManagedPopupWindow(WebViewDialog.this, resultMsg, isUserGesture, popupUrl)
+                    ) {
+                        Log.d("InAppBrowser", "Created managed popup window");
+                        return true;
+                    }
                     if (!_options.getPreventDeeplink() && isUserGesture) {
                         try {
-                            WebView.HitTestResult result = view.getHitTestResult();
-                            String data = result.getExtra();
                             if (data != null && !data.isEmpty()) {
-                                Log.d("InAppBrowser", "Opening target=_blank link externally: " + data);
+                                Log.d("InAppBrowser", "Falling back to external browser for popup URL: " + data);
                                 Intent browserIntent = new Intent(Intent.ACTION_VIEW, Uri.parse(data));
                                 browserIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                                 _webView.getContext().startActivity(browserIntent);
                                 return false;
                             }
                         } catch (Exception e) {
-                            Log.e("InAppBrowser", "Error opening external link: " + e.getMessage());
+                            Log.e("InAppBrowser", "Error opening external popup fallback: " + e.getMessage());
                         }
-                    }
-
-                    // Only handle popup windows if Google Pay support is enabled
-                    if (_options.getEnableGooglePaySupport() && isUserGesture) {
-                        // Create a new WebView for the popup
-                        WebView popupWebView = new WebView(activity);
-                        popupWebView.getSettings().setJavaScriptEnabled(true);
-                        popupWebView.getSettings().setJavaScriptCanOpenWindowsAutomatically(true);
-                        popupWebView.getSettings().setSupportMultipleWindows(true);
-
-                        // Set WebViewClient to handle URL loading and closing
-                        popupWebView.setWebViewClient(
-                            new WebViewClient() {
-                                @Override
-                                public boolean shouldOverrideUrlLoading(WebView view, String url) {
-                                    Log.d("InAppBrowser", "Popup WebView loading URL: " + url);
-
-                                    // Handle Google Pay result URLs or close conditions
-                                    if (url.contains("google.com/pay") || url.contains("close") || url.contains("cancel")) {
-                                        Log.d("InAppBrowser", "Closing popup for Google Pay result");
-                                        // Notify the parent WebView and close popup
-                                        activity.runOnUiThread(() -> {
-                                            try {
-                                                if (popupWebView.getParent() != null) {
-                                                    ((ViewGroup) popupWebView.getParent()).removeView(popupWebView);
-                                                }
-                                                popupWebView.destroy();
-                                            } catch (Exception e) {
-                                                Log.e("InAppBrowser", "Error closing popup: " + e.getMessage());
-                                            }
-                                        });
-                                        return true;
-                                    }
-                                    return false;
-                                }
-                            }
-                        );
-
-                        // Set up the popup WebView transport
-                        WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
-                        transport.setWebView(popupWebView);
-                        resultMsg.sendToTarget();
-
-                        Log.d("InAppBrowser", "Created popup window for Google Pay");
-                        return true;
                     }
 
                     return false;
                 }
+
+                @Override
+                public void onCloseWindow(WebView window) {
+                    Log.d("InAppBrowser", "onCloseWindow called");
+                    if (window == _webView) {
+                        String currentUrl = getUrl();
+                        dismiss();
+                        if (_options != null && _options.getCallbacks() != null) {
+                            _options.getCallbacks().closeEvent(currentUrl);
+                        }
+                    } else {
+                        super.onCloseWindow(window);
+                    }
+                }
             }
         );
+
+        if (_options.getHandleDownloads()) {
+            _webView.setDownloadListener((url, userAgent, contentDisposition, mimeType, contentLength) -> {
+                Log.d(
+                    "InAppBrowser",
+                    "Handling WebView download: " + redactUrlForLogging(url) + ", mimeType=" + mimeType + ", bytes=" + contentLength
+                );
+                handleDownloadRequest(url, userAgent, contentDisposition, mimeType);
+            });
+        }
 
         Map<String, String> requestHeaders = new HashMap<>();
         if (_options.getHeaders() != null) {
@@ -1053,53 +2393,61 @@ public class WebViewDialog extends Dialog {
         String httpMethod = _options.getHttpMethod();
         String httpBody = _options.getHttpBody();
 
-        if (supportsRequestBody(httpMethod) && httpBody != null) {
-            // For POST/PUT/PATCH requests with body
-            // Note: Android WebView has limitations with custom headers on POST
-            // Headers may not be sent with the initial request when using postUrl
-            byte[] postData = httpBody.getBytes(StandardCharsets.UTF_8);
-            _webView.postUrl(this._options.getUrl(), postData);
+        if (!_options.isPopupWindowMode()) {
+            if (shouldBootstrapInitialLegacyProxyLoad()) {
+                loadInitialLegacyProxyContent(requestHeaders, httpMethod, httpBody);
+            } else if (supportsRequestBody(httpMethod) && httpBody != null) {
+                // For POST/PUT/PATCH requests with body
+                // Note: Android WebView has limitations with custom headers on POST
+                // Headers may not be sent with the initial request when using postUrl
+                byte[] postData = httpBody.getBytes(StandardCharsets.UTF_8);
+                _webView.postUrl(this._options.getUrl(), postData);
 
-            // Log a warning if headers were provided, as they won't be sent with postUrl
-            if (!requestHeaders.isEmpty()) {
-                Log.w(
-                    "InAppBrowser",
-                    "Custom headers were provided but may not be sent with POST request. " +
-                        "Android WebView's postUrl method has limited header support."
-                );
-            }
-        } else {
-            // For GET and other methods, use loadUrl with headers
-            _webView.loadUrl(this._options.getUrl(), requestHeaders);
-        }
-
-        _webView.requestFocus();
-        _webView.requestFocusFromTouch();
-
-        // Inject JavaScript interface early to ensure it's available immediately
-        // This complements the injection in onPageFinished and doUpdateVisitedHistory
-        _webView.post(() -> {
-            if (_webView != null) {
-                injectJavaScriptInterface();
-
-                // Inject Google Pay support enhancements if enabled
-                if (_options.getEnableGooglePaySupport()) {
-                    injectGooglePayPolyfills();
+                // Log a warning if headers were provided, as they won't be sent with postUrl
+                if (!requestHeaders.isEmpty()) {
+                    Log.w(
+                        "InAppBrowser",
+                        "Custom headers were provided but may not be sent with POST request. " +
+                            "Android WebView's postUrl method has limited header support."
+                    );
                 }
-
-                Log.d("InAppBrowser", "JavaScript interface injected early after URL load");
+            } else {
+                // For GET and other methods, use loadUrl with headers
+                _webView.loadUrl(this._options.getUrl(), requestHeaders);
             }
-        });
+
+            _webView.requestFocus();
+            _webView.requestFocusFromTouch();
+
+            // Inject JavaScript interface early to ensure it's available immediately
+            // This complements the injection in onPageFinished and doUpdateVisitedHistory
+            _webView.post(() -> {
+                if (_webView != null) {
+                    injectJavaScriptInterface();
+
+                    // Inject Google Pay support enhancements if enabled
+                    if (_options.getEnableGooglePaySupport()) {
+                        injectGooglePayPolyfills();
+                    }
+
+                    Log.d("InAppBrowser", "JavaScript interface injected early after URL load");
+                }
+            });
+        }
 
         setupToolbar();
         setWebViewClient();
 
         if (this._options.isHidden()) {
-            if (_options.getInvisibilityMode() == Options.InvisibilityMode.FAKE_VISIBLE) {
+            if (_options.isPopupWindowMode() || _options.getInvisibilityMode() == Options.InvisibilityMode.FAKE_VISIBLE) {
                 show();
-                applyHiddenMode();
+                if (!isHiddenModeActive) {
+                    applyHiddenMode();
+                }
             }
             resolveOpenWebViewIfNeeded();
+        } else if (_options.isPopupWindowMode()) {
+            show();
         } else if (!this._options.isPresentAfterPageLoad()) {
             show();
             resolveOpenWebViewIfNeeded();
@@ -2474,72 +3822,120 @@ public class WebViewDialog extends Dialog {
         buttonNearDoneView.setColorFilter(iconColor);
     }
 
-    public void handleProxyResultError(String result, String id) {
-        Log.i("InAppBrowserProxy", String.format("handleProxyResultError: %s, ok: %s id: %s", result, false, id));
-        ProxiedRequest proxiedRequest = proxiedRequestsHashmap.get(id);
-        if (proxiedRequest == null) {
-            Log.e("InAppBrowserProxy", "proxiedRequest is null");
+    private void updateNavigationButtonsState() {
+        if (_toolbar == null || _webView == null) {
             return;
         }
-        proxiedRequestsHashmap.remove(id);
-        proxiedRequest.semaphore.release();
+
+        ImageButton backButton = _toolbar.findViewById(R.id.backButton);
+        ImageButton forwardButton = _toolbar.findViewById(R.id.forwardButton);
+        if (backButton == null || forwardButton == null) {
+            return;
+        }
+
+        boolean canGoBack = _webView.canGoBack();
+        boolean canGoForward = _webView.canGoForward();
+
+        if (canGoBack) {
+            backButton.setImageResource(R.drawable.arrow_back_enabled);
+            backButton.setEnabled(true);
+            backButton.setColorFilter(iconColor);
+            backButton.setOnClickListener(
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View view) {
+                        if (_webView != null && _webView.canGoBack()) {
+                            _webView.goBack();
+                        }
+                    }
+                }
+            );
+        } else {
+            backButton.setImageResource(R.drawable.arrow_back_disabled);
+            backButton.setEnabled(false);
+            backButton.setColorFilter(Color.argb(128, Color.red(iconColor), Color.green(iconColor), Color.blue(iconColor)));
+            backButton.setOnClickListener(null);
+        }
+
+        if (canGoForward) {
+            forwardButton.setImageResource(R.drawable.arrow_forward_enabled);
+            forwardButton.setEnabled(true);
+            forwardButton.setColorFilter(iconColor);
+            forwardButton.setOnClickListener(
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View view) {
+                        if (_webView != null && _webView.canGoForward()) {
+                            _webView.goForward();
+                        }
+                    }
+                }
+            );
+        } else {
+            forwardButton.setImageResource(R.drawable.arrow_forward_disabled);
+            forwardButton.setEnabled(false);
+            forwardButton.setColorFilter(Color.argb(128, Color.red(iconColor), Color.green(iconColor), Color.blue(iconColor)));
+            forwardButton.setOnClickListener(null);
+        }
+    }
+
+    public void handleProxyResultError(String result, String id) {
+        Log.i("InAppBrowserProxy", String.format("handleProxyResultError: %s, ok: %s id: %s", result, false, id));
+        handleProxyResponse(id, null);
     }
 
     public void handleProxyResultOk(JSONObject result, String id) {
         Log.i("InAppBrowserProxy", String.format("handleProxyResultOk: %s, ok: %s, id: %s", result, true, id));
-        ProxiedRequest proxiedRequest = proxiedRequestsHashmap.get(id);
-        if (proxiedRequest == null) {
-            Log.e("InAppBrowserProxy", "proxiedRequest is null");
-            return;
+        JSObject response = new JSObject();
+        response.put("response", result);
+        handleProxyResponse(id, response);
+    }
+
+    private boolean isHttpOrHttpsUrl(String url) {
+        return url != null && (url.startsWith("https://") || url.startsWith("http://"));
+    }
+
+    private boolean isAuthorizedAppLink(String url, List<String> authorizedLinks) {
+        if (authorizedLinks == null || authorizedLinks.isEmpty() || url == null) {
+            return false;
         }
-        proxiedRequestsHashmap.remove(id);
-
-        if (result == null) {
-            proxiedRequest.semaphore.release();
-            return;
-        }
-
-        Map<String, String> responseHeaders = new HashMap<>();
-        String body;
-        int code;
-
+        final String urlHost;
         try {
-            body = result.getString("body");
-            code = result.getInt("code");
-            JSONObject headers = result.getJSONObject("headers");
-            for (Iterator<String> it = headers.keys(); it.hasNext(); ) {
-                String headerName = it.next();
-                String header = headers.getString(headerName);
-                responseHeaders.put(headerName, header);
+            URI uri = new URI(url);
+            String parsedUrlHost = uri.getHost();
+            if (parsedUrlHost == null) return false;
+            urlHost = parsedUrlHost.startsWith("www.") ? parsedUrlHost.substring(4) : parsedUrlHost;
+        } catch (URISyntaxException e) {
+            Log.e("InAppBrowser", "Invalid popup URL in authorized app link check: " + url, e);
+            return false;
+        }
+
+        for (String authorized : authorizedLinks) {
+            try {
+                URI authUri = new URI(authorized);
+                String authHost = authUri.getHost();
+                if (authHost == null) continue;
+                if (authHost.startsWith("www.")) authHost = authHost.substring(4);
+                if (urlHost.equalsIgnoreCase(authHost)) {
+                    return true;
+                }
+            } catch (URISyntaxException e) {
+                Log.e("InAppBrowser", "Skipping invalid authorized app link: " + authorized, e);
             }
-        } catch (JSONException e) {
-            Log.e("InAppBrowserProxy", "Cannot parse OK result", e);
-            return;
+        }
+        return false;
+    }
+
+    private boolean shouldLoadBlankTargetInCurrentWebView(String url) {
+        if (!isHttpOrHttpsUrl(url)) {
+            return false;
         }
 
-        String contentType = responseHeaders.get("Content-Type");
-        if (contentType == null) {
-            contentType = responseHeaders.get("content-type");
-        }
-        if (contentType == null) {
-            Log.e("InAppBrowserProxy", "'Content-Type' header is required");
-            return;
+        if (isAuthorizedAppLink(url, _options.getAuthorizedAppLinks())) {
+            return false;
         }
 
-        if (!((100 <= code && code <= 299) || (400 <= code && code <= 599))) {
-            Log.e("InAppBrowserProxy", String.format("Status code %s outside of the allowed range", code));
-            return;
-        }
-
-        WebResourceResponse webResourceResponse = new WebResourceResponse(
-            contentType,
-            "utf-8",
-            new ByteArrayInputStream(body.getBytes(StandardCharsets.UTF_8))
-        );
-
-        webResourceResponse.setStatusCodeAndReasonPhrase(code, getReasonPhrase(code));
-        proxiedRequest.response = webResourceResponse;
-        proxiedRequest.semaphore.release();
+        return _options.getPreventDeeplink() || _options.getOpenBlankTargetInWebView();
     }
 
     private void setWebViewClient() {
@@ -2562,12 +3958,19 @@ public class WebViewDialog extends Dialog {
                     if (authorizedLinks == null || authorizedLinks.isEmpty() || url == null) {
                         return false;
                     }
+                    final String urlHost;
                     try {
                         URI uri = new URI(url);
-                        String urlHost = uri.getHost();
-                        if (urlHost == null) return false;
-                        if (urlHost.startsWith("www.")) urlHost = urlHost.substring(4);
-                        for (String authorized : authorizedLinks) {
+                        String parsedUrlHost = uri.getHost();
+                        if (parsedUrlHost == null) return false;
+                        urlHost = parsedUrlHost.startsWith("www.") ? parsedUrlHost.substring(4) : parsedUrlHost;
+                    } catch (URISyntaxException e) {
+                        Log.e("InAppBrowser", "Invalid URI in isUrlAuthorized: " + url, e);
+                        return false;
+                    }
+
+                    for (String authorized : authorizedLinks) {
+                        try {
                             URI authUri = new URI(authorized);
                             String authHost = authUri.getHost();
                             if (authHost == null) continue;
@@ -2575,9 +3978,9 @@ public class WebViewDialog extends Dialog {
                             if (urlHost.equalsIgnoreCase(authHost)) {
                                 return true;
                             }
+                        } catch (URISyntaxException e) {
+                            Log.e("InAppBrowser", "Skipping invalid authorized app link: " + authorized, e);
                         }
-                    } catch (URISyntaxException e) {
-                        Log.e("InAppBrowser", "Invalid URI in isUrlAuthorized: " + url, e);
                     }
                     return false;
                 }
@@ -2807,9 +4210,16 @@ public class WebViewDialog extends Dialog {
                                         try {
                                             PrivateKey privateKey = KeyChain.getPrivateKey(activity, alias);
                                             X509Certificate[] certChain = KeyChain.getCertificateChain(activity, alias);
+                                            clientCertificateIdentities.put(
+                                                clientCertificateIdentityKey(request.getHost(), request.getPort(), "https"),
+                                                new ClientCertificateIdentity(privateKey, certChain)
+                                            );
                                             request.proceed(privateKey, certChain);
                                             Log.i("InAppBrowser", "Selected certificate: " + alias);
                                         } catch (Exception e) {
+                                            clientCertificateIdentities.remove(
+                                                clientCertificateIdentityKey(request.getHost(), request.getPort(), "https")
+                                            );
                                             try {
                                                 request.cancel();
                                             } catch (Exception cancelEx) {
@@ -2818,6 +4228,9 @@ public class WebViewDialog extends Dialog {
                                             Log.e("InAppBrowser", "Error selecting certificate: " + e.getMessage());
                                         }
                                     } else {
+                                        clientCertificateIdentities.remove(
+                                            clientCertificateIdentityKey(request.getHost(), request.getPort(), "https")
+                                        );
                                         try {
                                             request.cancel();
                                         } catch (Exception e) {
@@ -2835,6 +4248,7 @@ public class WebViewDialog extends Dialog {
                         );
                     } catch (Exception e) {
                         Log.e("InAppBrowser", "Error in onReceivedClientCertRequest: " + e.getMessage());
+                        clientCertificateIdentities.remove(clientCertificateIdentityKey(request.getHost(), request.getPort(), "https"));
                         try {
                             request.cancel();
                         } catch (Exception cancelEx) {
@@ -2843,132 +4257,257 @@ public class WebViewDialog extends Dialog {
                     }
                 }
 
-                private String randomRequestId() {
-                    return UUID.randomUUID().toString();
-                }
-
-                private String toBase64(String raw) {
-                    String s = Base64.encodeToString(raw.getBytes(), Base64.NO_WRAP);
-                    if (s.endsWith("=")) {
-                        s = s.substring(0, s.length() - 2);
-                    }
-                    return s;
-                }
-
-                //
-                //        void handleRedirect(String currentUrl, Response response) {
-                //          String loc = response.header("Location");
-                //          _webView.evaluateJavascript("");
-                //        }
-                //
                 @Override
                 public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
                     if (view == null || _webView == null) {
                         return null;
                     }
-                    Pattern pattern = _options.getProxyRequestsPattern();
-                    if (pattern == null) {
-                        return null;
-                    }
-                    Matcher matcher = pattern.matcher(request.getUrl().toString());
-                    if (!matcher.find()) {
+                    if (!shouldUseNativeProxy()) {
                         return null;
                     }
 
-                    // Requests matches the regex
-                    if (Objects.equals(request.getMethod(), "POST")) {
-                        // Log.e("HTTP", String.format("returned null (ok) %s", request.getUrl().toString()));
-                        return null;
-                    }
+                    String requestUrl = request.getUrl().toString();
+                    boolean bridgeBackedRequest = ProxyRequestSupport.isBridgeMarkerRequestUrl(requestUrl);
+                    String originalUrl;
+                    String method;
+                    Map<String, String> requestHeaders = new HashMap<>();
+                    String base64Body = "";
+                    String credentialsMode = "same-origin";
 
-                    Log.i("InAppBrowserProxy", String.format("Proxying request: %s", request.getUrl().toString()));
-
-                    // We need to call a JS function
-                    String requestId = randomRequestId();
-                    ProxiedRequest proxiedRequest = new ProxiedRequest();
-                    addProxiedRequest(requestId, proxiedRequest);
-
-                    // lsuakdchgbbaHandleProxiedRequest
-                    activity.runOnUiThread(
-                        new Runnable() {
-                            @Override
-                            public void run() {
-                                StringBuilder headers = new StringBuilder();
-                                Map<String, String> requestHeaders = request.getRequestHeaders();
-                                for (Map.Entry<String, String> header : requestHeaders.entrySet()) {
-                                    headers.append(
-                                        String.format("h[atob('%s')]=atob('%s');", toBase64(header.getKey()), toBase64(header.getValue()))
-                                    );
-                                }
-                                String jsTemplate = """
-                                    try {
-                                      function getHeaders() {
-                                        const h = {};
-                                        %s
-                                        return h;
-                                      }
-                                      window.InAppBrowserProxyRequest(new Request(atob('%s'), {
-                                        headers: getHeaders(),
-                                        method: '%s'
-                                      })).then(async (res) => {
-                                        Capacitor.Plugins.InAppBrowser.lsuakdchgbbaHandleProxiedRequest({
-                                          ok: true,
-                                          result: (!!res ? {
-                                            headers: Object.fromEntries(res.headers.entries()),
-                                            code: res.status,
-                                            body: (await res.text())
-                                          } : null),
-                                          id: '%s',
-                                          webviewId: '%s'
-                                        });
-                                      }).catch((e) => {
-                                        Capacitor.Plugins.InAppBrowser.lsuakdchgbbaHandleProxiedRequest({
-                                          ok: false,
-                                          result: e.toString(),
-                                          id: '%s',
-                                          webviewId: '%s'
-                                        });
-                                      });
-                                    } catch (e) {
-                                      Capacitor.Plugins.InAppBrowser.lsuakdchgbbaHandleProxiedRequest({
-                                        ok: false,
-                                        result: e.toString(),
-                                        id: '%s',
-                                        webviewId: '%s'
-                                      });
-                                    }
-                                    """;
-                                String dialogId = instanceId != null ? instanceId : "";
-                                String s = String.format(
-                                    jsTemplate,
-                                    headers,
-                                    toBase64(request.getUrl().toString()),
-                                    request.getMethod(),
-                                    requestId,
-                                    dialogId,
-                                    requestId,
-                                    dialogId,
-                                    requestId,
-                                    dialogId
-                                );
-                                // Log.i("HTTP", s);
-                                capacitorWebView.evaluateJavascript(s, null);
-                            }
+                    if (bridgeBackedRequest) {
+                        Uri uri = request.getUrl();
+                        originalUrl = uri.getQueryParameter("u");
+                        String requestId = uri.getQueryParameter("rid");
+                        if (originalUrl == null || requestId == null) {
+                            return null;
                         }
+
+                        if (
+                            ProxyRequestSupport.usesLegacyJsProxyMode(_options) &&
+                            !ProxyRequestSupport.shouldDelegateLegacyJsProxyRequest(_options, originalUrl)
+                        ) {
+                            if (proxyBridge != null) {
+                                proxyBridge.getAndRemove(requestId);
+                            }
+                            Log.w("InAppBrowserProxy", "Ignoring legacy regex miss for bridge-backed request: " + originalUrl);
+                            return createCanceledResponse();
+                        }
+
+                        ProxyBridge.StoredRequest stored = proxyBridge != null ? proxyBridge.getAndRemove(requestId) : null;
+                        if (stored == null) {
+                            Log.e("InAppBrowserProxy", "Missing stored proxy bridge payload for request id: " + requestId);
+                            return createCanceledResponse();
+                        }
+                        method = stored.method;
+                        base64Body = stored.base64Body;
+                        credentialsMode = stored.credentialsMode;
+                        Map<String, String> safeMarkerHeaders = ProxyRequestSupport.extractSafeMarkerHeaders(request.getRequestHeaders());
+                        try {
+                            requestHeaders = ProxyRequestSupport.mergeRequestHeaders(null, stored.headersJson);
+                            requestHeaders = ProxyRequestSupport.mergeMissingHeaders(requestHeaders, safeMarkerHeaders);
+                        } catch (JSONException error) {
+                            Log.e("InAppBrowserProxy", "Failed to parse stored proxy headers", error);
+                            return createCanceledResponse();
+                        }
+                        String initiatorUrl = request.getRequestHeaders().get("Referer");
+                        if (initiatorUrl == null || initiatorUrl.isBlank()) {
+                            initiatorUrl = _webView.getUrl();
+                        }
+                        String targetCookies = CookieManager.getInstance().getCookie(originalUrl);
+                        if (
+                            targetCookies != null &&
+                            !targetCookies.isBlank() &&
+                            ProxyRequestSupport.shouldInjectCookies(credentialsMode, initiatorUrl, originalUrl, requestHeaders)
+                        ) {
+                            requestHeaders.put("Cookie", targetCookies);
+                        }
+                    } else {
+                        if (!ProxyRequestSupport.shouldHandleNonBridgeRequest(_options, requestUrl)) {
+                            return null;
+                        }
+
+                        originalUrl = requestUrl;
+                        method = request.getMethod();
+                        if (request.getRequestHeaders() != null) {
+                            requestHeaders.putAll(request.getRequestHeaders());
+                        }
+                    }
+
+                    NativeRequestContext requestContext = new NativeRequestContext(
+                        originalUrl,
+                        method,
+                        requestHeaders,
+                        base64Body,
+                        request.isForMainFrame(),
+                        credentialsMode
                     );
 
-                    // 10 seconds wait max
-                    try {
-                        if (proxiedRequest.semaphore.tryAcquire(1, 10, TimeUnit.SECONDS)) {
-                            return proxiedRequest.response;
-                        } else {
-                            Log.e("InAppBrowserProxy", "Semaphore timed out");
-                            removeProxiedRequest(requestId); // prevent mem leak
-                        }
-                    } catch (InterruptedException e) {
-                        Log.e("InAppBrowserProxy", "Semaphore wait error", e);
+                    if (
+                        ProxyRequestSupport.shouldLetWebViewHandleMissingBody(requestUrl, requestContext.method, requestContext.base64Body)
+                    ) {
+                        Log.w("InAppBrowserProxy", "Allowing WebView to handle request with uncaptured body: " + requestContext.url);
+                        return null;
                     }
-                    return null;
+
+                    boolean legacyProxyMode = ProxyRequestSupport.usesLegacyJsProxyMode(_options);
+                    boolean shouldDelegateLegacyRequest = ProxyRequestSupport.shouldDelegateLegacyJsProxyRequest(
+                        _options,
+                        requestContext.url
+                    );
+
+                    NativeProxyRule outboundRule =
+                        legacyProxyMode && shouldDelegateLegacyRequest
+                            ? new NativeProxyRule(
+                                  null,
+                                  null,
+                                  null,
+                                  null,
+                                  null,
+                                  null,
+                                  null,
+                                  null,
+                                  false,
+                                  NativeProxyRule.Action.DELEGATE_TO_JS
+                              )
+                            : findMatchingRule(_options.getOutboundProxyRules(), requestContext, null);
+
+                    if (outboundRule != null && outboundRule.getAction() == NativeProxyRule.Action.CANCEL) {
+                        return createCanceledResponse();
+                    }
+
+                    if (outboundRule != null && outboundRule.getAction() == NativeProxyRule.Action.DELEGATE_TO_JS) {
+                        String proxyId = UUID.randomUUID().toString();
+                        ProxiedRequest proxiedRequest = new ProxiedRequest();
+                        proxiedRequest.requestContext = requestContext;
+                        addProxiedRequest(proxyId, proxiedRequest);
+
+                        String dialogId = instanceId != null ? instanceId : "";
+                        _options
+                            .getCallbacks()
+                            .proxyRequestEvent(
+                                proxyId,
+                                "outbound",
+                                requestContext.url,
+                                requestContext.method,
+                                serializeHeaders(requestContext.headers),
+                                requestContext.base64Body.isEmpty() ? null : requestContext.base64Body,
+                                null,
+                                null,
+                                null,
+                                dialogId
+                            );
+
+                        try {
+                            if (proxiedRequest.semaphore.tryAcquire(1, 10, TimeUnit.SECONDS)) {
+                                if (proxiedRequest.canceled) {
+                                    return createCanceledResponse();
+                                }
+                                if (proxiedRequest.response != null) {
+                                    return proxiedRequest.response;
+                                }
+                                requestContext = proxiedRequest.requestContext != null ? proxiedRequest.requestContext : requestContext;
+                            } else {
+                                synchronized (proxiedRequest) {
+                                    proxiedRequest.timedOut = true;
+                                }
+                                removeProxiedRequest(proxyId);
+                                Log.w("InAppBrowserProxy", "Proxy timeout, falling back to native replay for: " + requestContext.url);
+                            }
+                        } catch (InterruptedException error) {
+                            removeProxiedRequest(proxyId);
+                            Thread.currentThread().interrupt();
+                            Log.e("InAppBrowserProxy", "Semaphore wait error", error);
+                            return bridgeBackedRequest ? createCanceledResponse() : null;
+                        }
+                    }
+
+                    NativeResponseData nativeResponse;
+                    try {
+                        nativeResponse = performNativeRequest(requestContext);
+                    } catch (IOException error) {
+                        Log.e("InAppBrowserProxy", "Native request failed for: " + requestContext.url, error);
+                        return bridgeBackedRequest ? createCanceledResponse() : null;
+                    }
+
+                    int redirectsFollowed = 0;
+                    while (true) {
+                        NativeProxyRule inboundRule = findMatchingRule(_options.getInboundProxyRules(), requestContext, nativeResponse);
+                        if (inboundRule == null || inboundRule.getAction() == NativeProxyRule.Action.CONTINUE) {
+                            RedirectReplayResult redirectReplay;
+                            try {
+                                redirectReplay = followRedirectForWebView(requestContext, nativeResponse, redirectsFollowed);
+                            } catch (IOException error) {
+                                Log.e("InAppBrowserProxy", "Native redirect replay failed for: " + requestContext.url, error);
+                                return bridgeBackedRequest ? createCanceledResponse() : null;
+                            }
+                            if (redirectReplay != null) {
+                                requestContext = redirectReplay.requestContext;
+                                nativeResponse = redirectReplay.responseData;
+                                redirectsFollowed++;
+                                continue;
+                            }
+                            return buildWebResourceResponse(nativeResponse);
+                        }
+                        if (inboundRule.getAction() == NativeProxyRule.Action.CANCEL) {
+                            return createCanceledResponse();
+                        }
+
+                        String proxyId = UUID.randomUUID().toString();
+                        ProxiedRequest proxiedRequest = new ProxiedRequest();
+                        proxiedRequest.requestContext = requestContext;
+                        proxiedRequest.nativeResponse = nativeResponse;
+                        addProxiedRequest(proxyId, proxiedRequest);
+
+                        String dialogId = instanceId != null ? instanceId : "";
+                        _options
+                            .getCallbacks()
+                            .proxyRequestEvent(
+                                proxyId,
+                                "inbound",
+                                requestContext.url,
+                                requestContext.method,
+                                serializeHeaders(requestContext.headers),
+                                requestContext.base64Body.isEmpty() ? null : requestContext.base64Body,
+                                nativeResponse.statusCode,
+                                serializeHeaders(nativeResponse.headers),
+                                Base64.encodeToString(nativeResponse.bodyBytes, Base64.NO_WRAP),
+                                dialogId
+                            );
+
+                        try {
+                            if (proxiedRequest.semaphore.tryAcquire(1, 10, TimeUnit.SECONDS)) {
+                                if (proxiedRequest.canceled) {
+                                    return createCanceledResponse();
+                                }
+                                if (proxiedRequest.response != null) {
+                                    return proxiedRequest.response;
+                                }
+                            } else {
+                                synchronized (proxiedRequest) {
+                                    proxiedRequest.timedOut = true;
+                                }
+                                removeProxiedRequest(proxyId);
+                            }
+                        } catch (InterruptedException error) {
+                            Thread.currentThread().interrupt();
+                            Log.e("InAppBrowserProxy", "Semaphore wait error", error);
+                        }
+
+                        RedirectReplayResult redirectReplay;
+                        try {
+                            redirectReplay = followRedirectForWebView(requestContext, nativeResponse, redirectsFollowed);
+                        } catch (IOException error) {
+                            Log.e("InAppBrowserProxy", "Native redirect replay failed for: " + requestContext.url, error);
+                            return bridgeBackedRequest ? createCanceledResponse() : null;
+                        }
+                        if (redirectReplay != null) {
+                            requestContext = redirectReplay.requestContext;
+                            nativeResponse = redirectReplay.responseData;
+                            redirectsFollowed++;
+                            continue;
+                        }
+                        return buildWebResourceResponse(nativeResponse);
+                    }
                 }
 
                 @Override
@@ -3041,6 +4580,12 @@ public class WebViewDialog extends Dialog {
                     if (view == null || _webView == null) {
                         return;
                     }
+                    if (ProxyRequestSupport.shouldInjectBridge(_options) && proxyBridgeScript != null && proxyAccessToken != null) {
+                        String preparedProxyBridgeScript = prepareProxyBridgeScript();
+                        if (preparedProxyBridgeScript != null) {
+                            view.evaluateJavascript(preparedProxyBridgeScript, null);
+                        }
+                    }
                     try {
                         URI uri = new URI(url);
                         if (TextUtils.isEmpty(_options.getTitle())) {
@@ -3058,6 +4603,7 @@ public class WebViewDialog extends Dialog {
                     if (!isReload) {
                         _options.getCallbacks().urlChangeEvent(url);
                     }
+                    updateNavigationButtonsState();
                     super.doUpdateVisitedHistory(view, url, isReload);
                     injectJavaScriptInterface();
 
@@ -3115,47 +4661,7 @@ public class WebViewDialog extends Dialog {
                         );
                     }
 
-                    ImageButton backButton = _toolbar.findViewById(R.id.backButton);
-                    if (_webView != null && _webView.canGoBack()) {
-                        backButton.setImageResource(R.drawable.arrow_back_enabled);
-                        backButton.setEnabled(true);
-                        backButton.setColorFilter(iconColor);
-                        backButton.setOnClickListener(
-                            new View.OnClickListener() {
-                                @Override
-                                public void onClick(View view) {
-                                    if (_webView != null && _webView.canGoBack()) {
-                                        _webView.goBack();
-                                    }
-                                }
-                            }
-                        );
-                    } else {
-                        backButton.setImageResource(R.drawable.arrow_back_disabled);
-                        backButton.setEnabled(false);
-                        backButton.setColorFilter(Color.argb(128, Color.red(iconColor), Color.green(iconColor), Color.blue(iconColor)));
-                    }
-
-                    ImageButton forwardButton = _toolbar.findViewById(R.id.forwardButton);
-                    if (_webView != null && _webView.canGoForward()) {
-                        forwardButton.setImageResource(R.drawable.arrow_forward_enabled);
-                        forwardButton.setEnabled(true);
-                        forwardButton.setColorFilter(iconColor);
-                        forwardButton.setOnClickListener(
-                            new View.OnClickListener() {
-                                @Override
-                                public void onClick(View view) {
-                                    if (_webView != null && _webView.canGoForward()) {
-                                        _webView.goForward();
-                                    }
-                                }
-                            }
-                        );
-                    } else {
-                        forwardButton.setImageResource(R.drawable.arrow_forward_disabled);
-                        forwardButton.setEnabled(false);
-                        forwardButton.setColorFilter(Color.argb(128, Color.red(iconColor), Color.green(iconColor), Color.blue(iconColor)));
-                    }
+                    updateNavigationButtonsState();
 
                     _options.getCallbacks().pageLoaded();
                     injectJavaScriptInterface();
@@ -3301,6 +4807,8 @@ public class WebViewDialog extends Dialog {
 
     @Override
     public void dismiss() {
+        scheduleHostWebViewInsetRestore();
+
         // First, stop any ongoing operations and disable further interactions
         if (_webView != null) {
             try {
@@ -3406,6 +4914,12 @@ public class WebViewDialog extends Dialog {
             }
         }
 
+        for (BlobDownloadSession session : new java.util.ArrayList<>(blobDownloadSessions.values())) {
+            cleanupBlobDownloadSession(session, true);
+        }
+        blobDownloadSessions.clear();
+        clientCertificateIdentities.clear();
+
         // Shutdown executor service asynchronously to avoid blocking UI thread
         shutdownExecutorServiceAsync();
 
@@ -3419,6 +4933,79 @@ public class WebViewDialog extends Dialog {
         } catch (Exception e) {
             Log.e("InAppBrowser", "Error dismissing dialog: " + e.getMessage());
         }
+
+        scheduleHostWebViewInsetRestore();
+    }
+
+    private void requestInsetsOnHostView(View view) {
+        if (view == null) {
+            return;
+        }
+
+        view.requestLayout();
+        ViewCompat.requestApplyInsets(view);
+    }
+
+    private void scheduleHostWebViewInsetRestore() {
+        if (activity == null) {
+            return;
+        }
+        if (activity.isFinishing() || activity.isDestroyed()) {
+            return;
+        }
+
+        Window dialogWindow = getWindow();
+        View dialogDecorView = dialogWindow != null ? dialogWindow.getDecorView() : null;
+        if (dialogWindow != null && dialogDecorView != null) {
+            dialogDecorView.clearFocus();
+
+            WindowInsetsControllerCompat insetsController = new WindowInsetsControllerCompat(dialogWindow, dialogDecorView);
+            insetsController.hide(WindowInsetsCompat.Type.ime());
+
+            InputMethodManager inputMethodManager = (InputMethodManager) _context.getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (inputMethodManager != null) {
+                inputMethodManager.hideSoftInputFromWindow(dialogDecorView.getWindowToken(), 0);
+            }
+        }
+
+        if (_webView != null) {
+            _webView.clearFocus();
+        }
+        if (capacitorWebView == null) {
+            return;
+        }
+
+        Window hostWindow = activity.getWindow();
+        if (hostWindow == null) {
+            return;
+        }
+
+        View hostDecorView = hostWindow.getDecorView();
+        if (hostDecorView == null) {
+            return;
+        }
+
+        View hostContentView = activity.findViewById(android.R.id.content);
+        Runnable restoreInsets = () -> {
+            try {
+                capacitorWebView.clearFocus();
+                capacitorWebView.requestFocus();
+
+                requestInsetsOnHostView(hostDecorView);
+                requestInsetsOnHostView(hostContentView);
+
+                if (capacitorWebView.getParent() instanceof View parentView) {
+                    requestInsetsOnHostView(parentView);
+                }
+
+                requestInsetsOnHostView(capacitorWebView);
+            } catch (Exception e) {
+                Log.w("InAppBrowser", "Failed to restore host window insets after dismiss: " + e.getMessage());
+            }
+        };
+
+        hostDecorView.post(restoreInsets);
+        hostDecorView.postDelayed(restoreInsets, HOST_WEBVIEW_INSET_RETRY_DELAY_MS);
     }
 
     private void forceStopMediaCapture(WebView webView) {
@@ -3516,6 +5103,537 @@ public class WebViewDialog extends Dialog {
     public void removeProxiedRequest(String key) {
         synchronized (proxiedRequestsHashmap) {
             proxiedRequestsHashmap.remove(key);
+        }
+    }
+
+    private String loadProxyBridgeScript() {
+        try (InputStream is = _context.getAssets().open("proxy-bridge.js")) {
+            ByteArrayOutputStream result = new ByteArrayOutputStream();
+            byte[] buffer = new byte[4096];
+            int bytesRead;
+            while ((bytesRead = is.read(buffer)) != -1) {
+                result.write(buffer, 0, bytesRead);
+            }
+            return result.toString(StandardCharsets.UTF_8.name());
+        } catch (IOException e) {
+            Log.e("InAppBrowserProxy", "Failed to load proxy-bridge.js", e);
+            return null;
+        }
+    }
+
+    private static String escapeJavaScriptLiteral(String value) {
+        if (value == null || value.isEmpty()) {
+            return "";
+        }
+        return value
+            .replace("\\", "\\\\")
+            .replace("'", "\\'")
+            .replace("\r", "\\r")
+            .replace("\n", "\\n")
+            .replace("\u2028", "\\u2028")
+            .replace("\u2029", "\\u2029");
+    }
+
+    private String prepareProxyBridgeScript() {
+        if (proxyBridgeScript == null || proxyAccessToken == null) {
+            return null;
+        }
+
+        String proxyRegexSource = "";
+        if (ProxyRequestSupport.usesLegacyJsProxyMode(_options) && _options.getProxyRequestsPattern() != null) {
+            proxyRegexSource = _options.getProxyRequestsPattern().pattern();
+        }
+
+        return proxyBridgeScript
+            .replace("___CAPGO_PROXY_TOKEN___", escapeJavaScriptLiteral(proxyAccessToken))
+            .replace("___CAPGO_PROXY_REGEX___", escapeJavaScriptLiteral(proxyRegexSource));
+    }
+
+    private boolean shouldUseNativeProxy() {
+        return _options != null && _options.shouldEnableNativeProxy();
+    }
+
+    private boolean shouldBootstrapInitialLegacyProxyLoad() {
+        if (_options == null || _options.isPopupWindowMode()) {
+            return false;
+        }
+        return ProxyRequestSupport.shouldDelegateLegacyJsProxyRequest(_options, _options.getUrl());
+    }
+
+    private void loadInitialLegacyProxyContent(Map<String, String> requestHeaders, String httpMethod, String httpBody) {
+        final String initialUrl = _options.getUrl();
+        final Map<String, String> initialHeaders = requestHeaders != null ? new HashMap<>(requestHeaders) : new HashMap<>();
+        final String initialMethod = httpMethod != null && !httpMethod.isBlank() ? httpMethod : "GET";
+        final String initialBody =
+            supportsRequestBody(initialMethod) && httpBody != null
+                ? Base64.encodeToString(httpBody.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP)
+                : "";
+
+        executorService.execute(() -> {
+            NativeRequestContext requestContext = new NativeRequestContext(
+                initialUrl,
+                initialMethod,
+                initialHeaders,
+                initialBody,
+                true,
+                "same-origin"
+            );
+
+            try {
+                LegacyInitialProxyResult proxyResult = resolveLegacyInitialProxyResponse(requestContext);
+                if (proxyResult.canceled) {
+                    rejectOpenWebViewIfNeeded("Initial legacy proxy request canceled");
+                    return;
+                }
+
+                NativeResponseData responseData = proxyResult.responseData;
+                if (responseData == null || !canBootstrapHtmlResponse(responseData.contentType)) {
+                    rejectOpenWebViewIfNeeded("Initial legacy proxy request did not return bootstrap HTML");
+                    return;
+                }
+
+                ProxyRequestSupport.WebResourceResponseMetadata metadata = ProxyRequestSupport.resolveWebResourceResponseMetadata(
+                    responseData.contentType,
+                    responseData.headers
+                );
+                String encoding = metadata.encoding() != null && !metadata.encoding().isBlank() ? metadata.encoding() : "utf-8";
+                String body = decodeResponseBody(responseData.bodyBytes, encoding);
+                String bootstrapUrl = ProxyRequestSupport.resolveBootstrapBaseUrl(initialUrl, proxyResult.requestUrl);
+
+                if (_webView == null) {
+                    return;
+                }
+
+                _webView.post(() -> {
+                    if (_webView == null) {
+                        return;
+                    }
+                    _webView.loadDataWithBaseURL(bootstrapUrl, body, metadata.mimeType(), encoding, bootstrapUrl);
+                });
+            } catch (IOException error) {
+                Log.e("InAppBrowserProxy", "Initial legacy proxy bootstrap failed for: " + initialUrl, error);
+                rejectOpenWebViewIfNeeded("Initial legacy proxy bootstrap failed: " + error.getMessage());
+            }
+        });
+    }
+
+    private LegacyInitialProxyResult resolveLegacyInitialProxyResponse(NativeRequestContext requestContext) throws IOException {
+        String proxyId = UUID.randomUUID().toString();
+        ProxiedRequest proxiedRequest = new ProxiedRequest();
+        proxiedRequest.requestContext = requestContext;
+        addProxiedRequest(proxyId, proxiedRequest);
+
+        String dialogId = instanceId != null ? instanceId : "";
+        _options
+            .getCallbacks()
+            .proxyRequestEvent(
+                proxyId,
+                "outbound",
+                requestContext.url,
+                requestContext.method,
+                serializeHeaders(requestContext.headers),
+                requestContext.base64Body.isEmpty() ? null : requestContext.base64Body,
+                null,
+                null,
+                null,
+                dialogId
+            );
+
+        try {
+            if (proxiedRequest.semaphore.tryAcquire(1, 10, TimeUnit.SECONDS)) {
+                if (proxiedRequest.canceled) {
+                    return new LegacyInitialProxyResult(true, null, requestContext.url);
+                }
+                if (proxiedRequest.nativeResponse != null) {
+                    return new LegacyInitialProxyResult(false, proxiedRequest.nativeResponse, requestContext.url);
+                }
+                requestContext = proxiedRequest.requestContext != null ? proxiedRequest.requestContext : requestContext;
+            } else {
+                synchronized (proxiedRequest) {
+                    proxiedRequest.timedOut = true;
+                }
+                removeProxiedRequest(proxyId);
+            }
+        } catch (InterruptedException error) {
+            removeProxiedRequest(proxyId);
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while waiting for initial proxy response", error);
+        }
+
+        NativeResponseData nativeResponse = performNativeRequest(requestContext);
+        int redirectsFollowed = 0;
+        while (true) {
+            RedirectReplayResult redirectReplay = followRedirectForWebView(requestContext, nativeResponse, redirectsFollowed);
+            if (redirectReplay == null) {
+                return new LegacyInitialProxyResult(false, nativeResponse, requestContext.url);
+            }
+            requestContext = redirectReplay.requestContext;
+            nativeResponse = redirectReplay.responseData;
+            redirectsFollowed++;
+        }
+    }
+
+    private boolean canBootstrapHtmlResponse(String contentType) {
+        if (contentType == null || contentType.isBlank()) {
+            return false;
+        }
+        String normalizedContentType = contentType.toLowerCase(Locale.US);
+        return (
+            normalizedContentType.startsWith("text/html") ||
+            normalizedContentType.startsWith("application/xhtml+xml") ||
+            normalizedContentType.startsWith("text/plain")
+        );
+    }
+
+    private String decodeResponseBody(byte[] bodyBytes, String encoding) {
+        if (bodyBytes == null || bodyBytes.length == 0) {
+            return "";
+        }
+        try {
+            return new String(bodyBytes, Charset.forName(encoding));
+        } catch (Exception _error) {
+            return new String(bodyBytes, StandardCharsets.UTF_8);
+        }
+    }
+
+    private String decodeBase64Body(String base64Body) {
+        if (base64Body == null || base64Body.isEmpty()) {
+            return null;
+        }
+        try {
+            return new String(Base64.decode(base64Body, Base64.DEFAULT), StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    private String serializeHeaders(Map<String, String> headers) {
+        JSONObject jsonObject = new JSONObject();
+        if (headers != null) {
+            for (Map.Entry<String, String> entry : headers.entrySet()) {
+                try {
+                    jsonObject.put(entry.getKey(), entry.getValue());
+                } catch (JSONException ignored) {}
+            }
+        }
+        return jsonObject.toString();
+    }
+
+    private NativeProxyRule findMatchingRule(
+        List<NativeProxyRule> rules,
+        NativeRequestContext requestContext,
+        NativeResponseData responseData
+    ) {
+        if (rules == null) {
+            return null;
+        }
+        String decodedRequestBody = decodeBase64Body(requestContext.base64Body);
+        String serializedRequestHeaders = serializeHeaders(requestContext.headers);
+        String serializedResponseHeaders = responseData != null ? serializeHeaders(responseData.headers) : null;
+        String decodedResponseBody = responseData != null ? new String(responseData.bodyBytes, StandardCharsets.UTF_8) : null;
+        Integer statusCode = responseData != null ? responseData.statusCode : null;
+
+        for (NativeProxyRule rule : rules) {
+            if (
+                rule.matches(
+                    requestContext.url,
+                    requestContext.method,
+                    serializedRequestHeaders,
+                    decodedRequestBody,
+                    requestContext.mainFrame,
+                    statusCode,
+                    serializedResponseHeaders,
+                    decodedResponseBody
+                )
+            ) {
+                return rule;
+            }
+        }
+        return null;
+    }
+
+    private WebResourceResponse createCanceledResponse() {
+        WebResourceResponse response = new WebResourceResponse("text/plain", "utf-8", new ByteArrayInputStream(new byte[0]));
+        response.setStatusCodeAndReasonPhrase(204, "No Content");
+        response.setResponseHeaders(new HashMap<>());
+        return response;
+    }
+
+    private WebResourceResponse buildWebResourceResponse(NativeResponseData responseData) {
+        ProxyRequestSupport.WebResourceResponseMetadata metadata = ProxyRequestSupport.resolveWebResourceResponseMetadata(
+            responseData.contentType,
+            responseData.headers
+        );
+        WebResourceResponse webResourceResponse = new WebResourceResponse(
+            metadata.mimeType(),
+            metadata.encoding(),
+            new ByteArrayInputStream(responseData.bodyBytes)
+        );
+        String reasonPhrase = getReasonPhrase(responseData.statusCode);
+        if (reasonPhrase.isEmpty()) {
+            reasonPhrase = "Unknown";
+        }
+        webResourceResponse.setStatusCodeAndReasonPhrase(responseData.statusCode, reasonPhrase);
+        webResourceResponse.setResponseHeaders(responseData.headers);
+        return webResourceResponse;
+    }
+
+    private RedirectReplayResult followRedirectForWebView(
+        NativeRequestContext requestContext,
+        NativeResponseData responseData,
+        int redirectsFollowed
+    ) throws IOException {
+        String redirectUrl = ProxyRequestSupport.resolveRedirectUrl(requestContext.url, responseData.statusCode, responseData.headers);
+        if (redirectUrl == null) {
+            return null;
+        }
+        if (redirectsFollowed >= MAX_WEBVIEW_PROXY_REDIRECTS) {
+            throw new IOException("Too many proxy redirects for: " + requestContext.url);
+        }
+
+        NativeRequestContext redirectRequestContext = createRedirectRequestContext(requestContext, responseData.statusCode, redirectUrl);
+        NativeResponseData redirectResponse = performNativeRequest(redirectRequestContext);
+        return new RedirectReplayResult(redirectRequestContext, redirectResponse);
+    }
+
+    private NativeRequestContext createRedirectRequestContext(NativeRequestContext requestContext, int statusCode, String redirectUrl) {
+        boolean preserveRequestBody = ProxyRequestSupport.shouldPreserveRequestBodyOnRedirect(requestContext.method, statusCode);
+        String redirectMethod = ProxyRequestSupport.resolveRedirectMethod(requestContext.method, statusCode);
+        Map<String, String> redirectHeaders = ProxyRequestSupport.prepareRedirectHeaders(
+            requestContext.headers,
+            preserveRequestBody,
+            requestContext.url,
+            redirectUrl
+        );
+        String redirectCookies = CookieManager.getInstance().getCookie(redirectUrl);
+        if (
+            redirectCookies != null &&
+            !redirectCookies.isBlank() &&
+            ProxyRequestSupport.shouldInjectCookies(requestContext.credentialsMode, requestContext.url, redirectUrl, redirectHeaders)
+        ) {
+            redirectHeaders.put("Cookie", redirectCookies);
+        }
+        String redirectBody = preserveRequestBody ? requestContext.base64Body : "";
+        return new NativeRequestContext(
+            redirectUrl,
+            redirectMethod,
+            redirectHeaders,
+            redirectBody,
+            requestContext.mainFrame,
+            requestContext.credentialsMode
+        );
+    }
+
+    private NativeResponseData performNativeRequest(NativeRequestContext requestContext) throws IOException {
+        URL url = new URL(requestContext.url);
+        if (!ProxyRequestSupport.supportsNativeHttpRequest(url)) {
+            throw new IOException("Unsupported proxy URL: " + requestContext.url);
+        }
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        try {
+            conn.setConnectTimeout(REQUEST_CONNECT_TIMEOUT_MS);
+            conn.setReadTimeout(REQUEST_READ_TIMEOUT_MS);
+            conn.setRequestMethod(requestContext.method != null ? requestContext.method : "GET");
+            conn.setInstanceFollowRedirects(false);
+
+            for (Map.Entry<String, String> entry : requestContext.headers.entrySet()) {
+                conn.setRequestProperty(entry.getKey(), entry.getValue());
+            }
+
+            if (requestContext.base64Body != null && !requestContext.base64Body.isEmpty()) {
+                byte[] bodyBytes = ProxyRequestSupport.decodeBase64Body(requestContext.base64Body);
+                conn.setDoOutput(true);
+                try (java.io.OutputStream outputStream = conn.getOutputStream()) {
+                    outputStream.write(bodyBytes);
+                }
+            }
+
+            int status = conn.getResponseCode();
+            InputStream inputStream;
+            try {
+                inputStream = conn.getInputStream();
+            } catch (IOException e) {
+                inputStream = conn.getErrorStream();
+            }
+
+            byte[] bodyBytes = new byte[0];
+            if (inputStream != null) {
+                try (InputStream stream = inputStream; ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+                    byte[] buf = new byte[4096];
+                    int n;
+                    while ((n = stream.read(buf)) != -1) {
+                        baos.write(buf, 0, n);
+                    }
+                    bodyBytes = baos.toByteArray();
+                }
+            }
+
+            ProxyRequestSupport.ParsedResponseHeaders parsedHeaders = ProxyRequestSupport.splitResponseHeaders(conn.getHeaderFields());
+            applyResponseCookies(requestContext.url, parsedHeaders.cookieHeaders());
+            Map<String, String> responseHeaders = parsedHeaders.responseHeaders();
+
+            String contentType = responseHeaders.get("Content-Type");
+            if (contentType == null) {
+                contentType = responseHeaders.get("content-type");
+            }
+            if (contentType == null) {
+                contentType = conn.getContentType();
+            }
+
+            return new NativeResponseData(status, contentType, responseHeaders, bodyBytes);
+        } finally {
+            conn.disconnect();
+        }
+    }
+
+    private void applyResponseCookies(String requestUrl, java.util.List<String> cookieHeaders) {
+        if (requestUrl == null || requestUrl.isBlank() || cookieHeaders == null || cookieHeaders.isEmpty()) {
+            return;
+        }
+        CookieManager cookieManager = CookieManager.getInstance();
+        boolean wroteCookie = false;
+        for (String cookieHeader : cookieHeaders) {
+            if (cookieHeader == null || cookieHeader.isBlank()) {
+                continue;
+            }
+            cookieManager.setCookie(requestUrl, cookieHeader);
+            wroteCookie = true;
+        }
+        if (wroteCookie) {
+            cookieManager.flush();
+        }
+    }
+
+    public void handleProxyResponse(String requestId, JSObject response) {
+        ProxiedRequest proxiedRequest;
+        synchronized (proxiedRequestsHashmap) {
+            proxiedRequest = proxiedRequestsHashmap.get(requestId);
+        }
+        if (proxiedRequest == null) {
+            Log.e("InAppBrowserProxy", "No pending request for id: " + requestId);
+            return;
+        }
+        synchronized (proxiedRequest) {
+            if (proxiedRequest.timedOut) {
+                return;
+            }
+        }
+
+        if (response == null) {
+            synchronized (proxiedRequestsHashmap) {
+                proxiedRequestsHashmap.remove(requestId);
+            }
+            proxiedRequest.semaphore.release();
+            return;
+        }
+
+        synchronized (proxiedRequest) {
+            if (proxiedRequest.timedOut) {
+                return;
+            }
+            try {
+                Boolean canceled = response.getBool("cancel");
+                proxiedRequest.canceled = Boolean.TRUE.equals(canceled);
+
+                JSObject requestOverride = response.getJSObject("request");
+                if (requestOverride != null && proxiedRequest.requestContext != null) {
+                    String url = ProxyRequestSupport.resolveOverrideUrl(
+                        proxiedRequest.requestContext.url,
+                        requestOverride.getString("url", proxiedRequest.requestContext.url)
+                    );
+                    String method = ProxyRequestSupport.normalizeOverrideMethod(
+                        requestOverride.getString("method", proxiedRequest.requestContext.method)
+                    );
+                    JSObject headersObject = requestOverride.getJSObject("headers");
+                    Map<String, String> headers = ProxyRequestSupport.prepareOverrideHeaders(
+                        proxiedRequest.requestContext.headers,
+                        proxiedRequest.requestContext.url,
+                        url
+                    );
+                    if (headersObject != null) {
+                        headers = new HashMap<>();
+                        Iterator<String> keys = headersObject.keys();
+                        while (keys.hasNext()) {
+                            String key = keys.next();
+                            headers.put(key, headersObject.getString(key));
+                        }
+                    }
+                    boolean hasBodyOverride = requestOverride.has("body");
+                    Object rawOverrideBody = hasBodyOverride ? requestOverride.opt("body") : null;
+                    String body = ProxyRequestSupport.resolveOverrideBody(
+                        proxiedRequest.requestContext.base64Body,
+                        method,
+                        hasBodyOverride,
+                        rawOverrideBody == null || rawOverrideBody == JSONObject.NULL ? null : String.valueOf(rawOverrideBody)
+                    );
+                    proxiedRequest.requestContext = new NativeRequestContext(
+                        url,
+                        method,
+                        headers,
+                        body,
+                        proxiedRequest.requestContext.mainFrame,
+                        proxiedRequest.requestContext.credentialsMode
+                    );
+                }
+
+                JSObject responseOverride = response.getJSObject("response");
+                if (responseOverride == null && response.get("status") != null) {
+                    responseOverride = response;
+                }
+
+                if (responseOverride != null) {
+                    String base64Body = responseOverride.getString("body");
+                    int status = responseOverride.getInteger("status", 200);
+                    JSObject headers = responseOverride.getJSObject("headers");
+
+                    Map<String, String> responseHeaders = new HashMap<>();
+                    if (headers != null) {
+                        Iterator<String> keys = headers.keys();
+                        while (keys.hasNext()) {
+                            String key = keys.next();
+                            responseHeaders.put(key, headers.getString(key));
+                        }
+                    }
+
+                    byte[] bodyBytes = ProxyRequestSupport.decodeBase64Body(base64Body);
+                    ProxyRequestSupport.ParsedResponseHeaders parsedHeaders = ProxyRequestSupport.splitSyntheticResponseHeaders(
+                        responseHeaders
+                    );
+                    applyResponseCookies(proxiedRequest.requestContext.url, parsedHeaders.cookieHeaders());
+                    responseHeaders = parsedHeaders.responseHeaders();
+
+                    String contentType = responseHeaders.get("content-type");
+                    if (contentType == null) {
+                        contentType = responseHeaders.get("Content-Type");
+                    }
+                    if (contentType == null) {
+                        contentType = "application/octet-stream";
+                    }
+
+                    if (status < 100 || status > 599) {
+                        status = 200;
+                    }
+                    proxiedRequest.nativeResponse = new NativeResponseData(status, contentType, responseHeaders, bodyBytes);
+                    proxiedRequest.response = buildWebResourceResponse(proxiedRequest.nativeResponse);
+                }
+            } catch (IOException invalidBodyError) {
+                proxiedRequest.canceled = true;
+                Log.e("InAppBrowserProxy", "Invalid proxy response body for request: " + requestId, invalidBodyError);
+            } catch (Exception e) {
+                Log.e("InAppBrowserProxy", "Error building proxy response", e);
+            }
+        }
+
+        synchronized (proxiedRequestsHashmap) {
+            proxiedRequestsHashmap.remove(requestId);
+        }
+        proxiedRequest.semaphore.release();
+    }
+
+    @Override
+    public boolean hasPendingProxyRequest(String requestId) {
+        synchronized (proxiedRequestsHashmap) {
+            return proxiedRequestsHashmap.containsKey(requestId);
         }
     }
 
