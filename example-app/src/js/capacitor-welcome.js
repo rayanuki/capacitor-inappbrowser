@@ -9,6 +9,7 @@ import {
 import { setupProxyDemoButtons } from "./proxy-demo.js";
 import { setupProxyRegression } from "./proxy-regression.js";
 import { attachKeyboardRegressionHarness } from "./keyboard-regression.js";
+import { attachFeatureSmokeHarness } from "./feature-smoke.js";
 import { url as configuredTestWebappUrl } from "./url.js";
 
 // Default URL configuration
@@ -286,6 +287,7 @@ window.customElements.define(
       const self = this;
 
       attachKeyboardRegressionHarness();
+      attachFeatureSmokeHarness();
 
       // Helper function to validate URL
       function isValidUrl(string) {
@@ -362,6 +364,14 @@ window.customElements.define(
       let closeOnNextDownloadEvent = false;
       const downloadStatusElement = () => self.shadowRoot.querySelector("#download-event-status");
       const downloadListenerButtonElement = () => self.shadowRoot.querySelector("#open-download-demo-listener");
+      const maestroRunDownloadButton = document.getElementById("maestro-run-download");
+      const maestroDownloadStatus = document.getElementById("maestro-download-status");
+
+      function setMaestroDownloadStatus(message) {
+        if (maestroDownloadStatus) {
+          maestroDownloadStatus.textContent = message;
+        }
+      }
 
       function setDownloadStatus(message, { backgroundColor = "#f8f9fa", color = "#495057" } = {}) {
         const statusElement = downloadStatusElement();
@@ -399,7 +409,12 @@ window.customElements.define(
 
         downloadListenerHandles = await Promise.all([
           InAppBrowser.addListener("downloadCompleted", (event) => {
-            setDownloadListenerButtonLabel(`Event OK: ${event.fileName}`);
+            const successLabel = `Event OK: ${event.fileName}`;
+            setDownloadListenerButtonLabel(successLabel);
+            setMaestroDownloadStatus(successLabel);
+            if (maestroRunDownloadButton) {
+              maestroRunDownloadButton.disabled = false;
+            }
             setDownloadStatus(
               `Download completed: ${event.fileName} via ${event.handledBy}`,
               { backgroundColor: "#dcfce7", color: "#166534" },
@@ -415,6 +430,10 @@ window.customElements.define(
           InAppBrowser.addListener("downloadFailed", (event) => {
             closeOnNextDownloadEvent = false;
             setDownloadListenerButtonLabel("Event Failed");
+            setMaestroDownloadStatus("Event Failed");
+            if (maestroRunDownloadButton) {
+              maestroRunDownloadButton.disabled = false;
+            }
             const fileLabel = event.fileName ? ` for ${event.fileName}` : "";
             setDownloadStatus(
               `Download failed${fileLabel}: ${event.error}`,
@@ -429,22 +448,24 @@ window.customElements.define(
       async function openAutoDownloadDemo({ closeOnEvent = false } = {}) {
         const handleDownloadsToggle = self.shadowRoot.querySelector("#handle-downloads-toggle");
         closeOnNextDownloadEvent = closeOnEvent && handleDownloadsToggle.checked;
+        if (maestroRunDownloadButton) {
+          maestroRunDownloadButton.disabled = true;
+        }
         setDownloadListenerButtonLabel(
           closeOnEvent && handleDownloadsToggle.checked
             ? "Waiting For Download Event..."
             : "Open Auto Download Demo + Close On Event",
         );
-        setDownloadStatus(
-          handleDownloadsToggle.checked
-            ? closeOnEvent
-              ? "Waiting for native download event, then closing the webview..."
-              : "Waiting for native download event..."
-            : "Native download handling disabled for this run.",
-          {
-            backgroundColor: handleDownloadsToggle.checked ? "#e0f2fe" : "#f8f9fa",
-            color: handleDownloadsToggle.checked ? "#075985" : "#495057",
-          },
-        );
+        const downloadMessage = handleDownloadsToggle.checked
+          ? closeOnEvent
+            ? "Waiting for native download event, then closing the webview..."
+            : "Waiting for native download event..."
+          : "Native download handling disabled for this run.";
+        setMaestroDownloadStatus(downloadMessage);
+        setDownloadStatus(downloadMessage, {
+          backgroundColor: handleDownloadsToggle.checked ? "#e0f2fe" : "#f8f9fa",
+          color: handleDownloadsToggle.checked ? "#075985" : "#495057",
+        });
 
         try {
           await createDownloadListeners();
@@ -461,6 +482,10 @@ window.customElements.define(
           });
         } catch (error) {
           closeOnNextDownloadEvent = false;
+          if (maestroRunDownloadButton) {
+            maestroRunDownloadButton.disabled = false;
+          }
+          setMaestroDownloadStatus("Download open failed");
           console.error("Error opening auto download demo:", error);
         }
       }
@@ -501,21 +526,66 @@ window.customElements.define(
         </html>
       `;
       const blankTargetTestUrl = `data:text/html;charset=utf-8,${encodeURIComponent(blankTargetTestHtml)}`;
+      const blankTargetButton = self.shadowRoot.querySelector("#open-blank-target-test");
       const blankTargetStatusText = self.shadowRoot.querySelector("#blank-target-status-text");
       const blankTargetResultText = self.shadowRoot.querySelector("#blank-target-result-text");
       const blankTargetLastUrlText = self.shadowRoot.querySelector("#blank-target-last-url-text");
+      const maestroRunBlankTargetButton = document.getElementById("maestro-run-blank-target");
+      const maestroBlankTargetStatus = document.getElementById("maestro-blank-target-status");
+      const maestroBlankTargetDetails = document.getElementById("maestro-blank-target-details");
       let blankTargetTestActive = false;
       let blankTargetWebViewId = null;
       let blankTargetListenerHandles = [];
+
+      function setBlankTargetButtonsDisabled(disabled) {
+        if (blankTargetButton) {
+          blankTargetButton.disabled = disabled;
+        }
+        if (maestroRunBlankTargetButton) {
+          maestroRunBlankTargetButton.disabled = disabled;
+        }
+      }
+
+      function updateMaestroBlankTargetState({ status, result, lastUrl }) {
+        if (!maestroBlankTargetStatus || !maestroBlankTargetDetails) {
+          return;
+        }
+
+        if (status === "Closed" && result === "internal navigation confirmed" && lastUrl === blankTargetExpectedUrl) {
+          maestroBlankTargetStatus.textContent = "Blank target regression passed";
+        } else if (status === "Idle") {
+          maestroBlankTargetStatus.textContent = "Not started";
+        } else if (status === "Page load error" || (status === "Closed" && result !== "internal navigation confirmed")) {
+          maestroBlankTargetStatus.textContent = "Blank target regression failed";
+        } else {
+          maestroBlankTargetStatus.textContent = `Blank target regression: ${status}`;
+        }
+
+        maestroBlankTargetDetails.textContent = `${result}\n${lastUrl}`;
+      }
 
       function setBlankTargetState({ status, result, lastUrl }) {
         blankTargetStatusText.textContent = status;
         blankTargetResultText.textContent = result;
         blankTargetLastUrlText.textContent = lastUrl;
+        updateMaestroBlankTargetState({ status, result, lastUrl });
       }
 
       function isBlankTargetEvent(result) {
-        return blankTargetTestActive && result?.id === blankTargetWebViewId;
+        if (!blankTargetTestActive) {
+          return false;
+        }
+
+        if (!result?.id) {
+          return blankTargetWebViewId === null;
+        }
+
+        if (blankTargetWebViewId === null) {
+          blankTargetWebViewId = result.id;
+          return true;
+        }
+
+        return result.id === blankTargetWebViewId;
       }
 
       async function clearBlankTargetListeners() {
@@ -565,6 +635,7 @@ window.customElements.define(
                   : `closed on ${closedUrl}`,
               lastUrl: closedUrl,
             });
+            setBlankTargetButtonsDisabled(false);
 
             await clearBlankTargetListeners();
           }),
@@ -580,6 +651,7 @@ window.customElements.define(
               result: "page load error",
               lastUrl: blankTargetLastUrlText.textContent,
             });
+            setBlankTargetButtonsDisabled(false);
 
             await clearBlankTargetListeners();
           }),
@@ -906,44 +978,53 @@ window.customElements.define(
           }
         });
 
-      self.shadowRoot
-        .querySelector("#open-blank-target-test")
-        .addEventListener("click", async function () {
-          blankTargetTestActive = true;
+      blankTargetButton.addEventListener("click", async function () {
+        blankTargetTestActive = true;
+        blankTargetWebViewId = null;
+        setBlankTargetButtonsDisabled(true);
+        setBlankTargetState({
+          status: "Opening test webview...",
+          result: "waiting for navigation",
+          lastUrl: "none",
+        });
+
+        try {
+          await attachBlankTargetListeners();
+
+          const { id } = await InAppBrowser.openWebView({
+            url: blankTargetTestUrl,
+            toolbarType: ToolBarType.COMPACT,
+            backgroundColor: BackgroundColor.WHITE,
+            title: "Target Blank Test",
+            visibleTitle: true,
+            showReloadButton: false,
+            activeNativeNavigationForWebview: false,
+            enabledSafeBottomMargin: true,
+            preventDeeplink: true,
+          });
+          if (blankTargetTestActive) {
+            blankTargetWebViewId = id;
+          }
+        } catch (e) {
+          blankTargetTestActive = false;
           blankTargetWebViewId = null;
+          setBlankTargetButtonsDisabled(false);
+          await clearBlankTargetListeners();
+          console.error("Error opening blank target test:", e);
           setBlankTargetState({
-            status: "Opening test webview...",
-            result: "waiting for navigation",
+            status: "Error",
+            result: e.message,
             lastUrl: "none",
           });
+        }
+      });
 
-          try {
-            await attachBlankTargetListeners();
-
-            const { id } = await InAppBrowser.openWebView({
-              url: blankTargetTestUrl,
-              toolbarType: ToolBarType.COMPACT,
-              backgroundColor: BackgroundColor.WHITE,
-              title: "Target Blank Test",
-              visibleTitle: true,
-              showReloadButton: false,
-              activeNativeNavigationForWebview: false,
-              enabledSafeBottomMargin: true,
-              openBlankTargetInWebView: true,
-            });
-            blankTargetWebViewId = id;
-          } catch (e) {
-            blankTargetTestActive = false;
-            blankTargetWebViewId = null;
-            await clearBlankTargetListeners();
-            console.error("Error opening blank target test:", e);
-            setBlankTargetState({
-              status: "Error",
-              result: e.message,
-              lastUrl: "none",
-            });
-          }
+      if (maestroRunBlankTargetButton) {
+        maestroRunBlankTargetButton.addEventListener("click", () => {
+          blankTargetButton.click();
         });
+        maestroRunBlankTargetButton.disabled = false;
+      }
 
       // Add Enter key support for the input field
       self.shadowRoot
@@ -1036,6 +1117,13 @@ window.customElements.define(
         .addEventListener("click", async function () {
           await openAutoDownloadDemo({ closeOnEvent: true });
         });
+
+      if (maestroRunDownloadButton) {
+        maestroRunDownloadButton.addEventListener("click", async function () {
+          await openAutoDownloadDemo({ closeOnEvent: true });
+        });
+        maestroRunDownloadButton.disabled = false;
+      }
 
       self.shadowRoot
         .querySelector("#system-bars-show-all")

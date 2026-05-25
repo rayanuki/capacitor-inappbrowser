@@ -421,6 +421,13 @@ final class PendingProxyTask {
 
 // swiftlint:disable type_body_length
 public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDelegate {
+    /// HTTP status codes for which URLSession actually triggers
+    /// `urlSession(_:task:willPerformHTTPRedirection:newRequest:completionHandler:)`.
+    /// Scoped narrowly so other 3xx responses (300, 304, 305, 306) flow through the
+    /// dataTask completion handler normally — 304 Not Modified in particular must
+    /// still reach finish() or the scheme task strands.
+    static let redirectStatusCodes: Set<Int> = [301, 302, 303, 307, 308]
+
     weak var plugin: InAppBrowserPlugin?
     private var pendingTasks: [String: PendingProxyTask] = [:]
     private var stoppedRequests: [String: UUID] = [:]
@@ -619,6 +626,25 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
             }
 
             let httpResponse = response as? HTTPURLResponse
+            // Actual HTTP redirect status codes are the exclusive responsibility of
+            // urlSession(_:task:willPerformHTTPRedirection:newRequest:completionHandler:).
+            // When that delegate calls completionHandler(nil) to suppress URLSession's
+            // automatic redirect-following, URLSession still surfaces the redirect body
+            // to this completion handler as a normal response. Without this guard, the
+            // willPerformHTTPRedirection path and this completion handler both race to
+            // mutate pendingTask.responseData and call executeInboundDecision; the late-
+            // firing one overwrites the redirect-target state and ends up handing the
+            // empty redirect body to the WKURLSchemeTask via finish(), short-circuiting
+            // the actual redirect-target fetch.
+            //
+            // Scoped narrowly to the codes that actually trigger willPerformHTTPRedirection
+            // (301, 302, 303, 307, 308). Other 3xx — 300, 304 Not Modified, 305, 306 — are
+            // NOT redirects and the delegate doesn't fire for them, so they must flow
+            // through this completion handler normally (a 304 in particular needs the
+            // scheme task to be didFinish()'d with the cached/empty body, not stranded).
+            if let httpResponse, ProxySchemeHandler.redirectStatusCodes.contains(httpResponse.statusCode) {
+                return
+            }
             let responseHeaders = ProxySchemeRequestSupport.normalizedResponseHeaders(from: httpResponse)
             pendingTask.requestContext.url = ProxySchemeRequestSupport.resolvedResponseURL(
                 response,
@@ -925,7 +951,18 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
         }
         var request = URLRequest(url: url)
         request.httpMethod = context.method
-        request.allHTTPHeaderFields = context.headers
+        // URLSession will auto-decompress gzip/br/zstd responses only when
+        // Accept-Encoding is NOT present in the request headers (URLSession
+        // adds its own and owns the decompression in that case). If we forward
+        // an Accept-Encoding value supplied by the JS handler (or carried over
+        // by URLSession's own redirect-rewriting), URLSession assumes the
+        // caller will handle decompression and passes the raw compressed bytes
+        // through, which the WKURLSchemeTask then renders as gibberish in the
+        // WebView. Strip it so URLSession's transparent decompression kicks in.
+        let filteredHeaders = context.headers.filter { key, _ in
+            key.caseInsensitiveCompare("Accept-Encoding") != .orderedSame
+        }
+        request.allHTTPHeaderFields = filteredHeaders
         if
             ProxySchemeRequestSupport.supportsRequestBody(method: context.method),
             let bodyData = try ProxySchemeRequestSupport.decodedRequestBody(from: context.base64Body) {
@@ -1014,15 +1051,10 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
     }
 
     private func syncResponseCookies(from response: URLResponse?, fallbackURL: String, completion: @escaping () -> Void) {
-        guard
-            let plugin,
-            let cookieStore = plugin.cookieStore(for: webviewId),
-            !fallbackURL.isEmpty
-        else {
+        guard !fallbackURL.isEmpty else {
             completion()
             return
         }
-
         let cookies = ProxySchemeRequestSupport.responseCookies(
             response: response,
             fallback: fallbackURL
@@ -1031,44 +1063,51 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
             completion()
             return
         }
-
-        let group = DispatchGroup()
-        for cookie in cookies {
-            group.enter()
-            cookieStore.setCookie(cookie) {
-                group.leave()
-            }
-        }
-        group.notify(queue: .main) {
-            completion()
-        }
+        writeCookiesOnMain(cookies, completion: completion)
     }
 
     private func syncResponseCookies(from responseData: NativeResponseData, fallbackURL: String, completion: @escaping () -> Void) {
-        guard
-            let plugin,
-            let cookieStore = plugin.cookieStore(for: webviewId),
-            !fallbackURL.isEmpty
-        else {
+        guard !fallbackURL.isEmpty else {
             completion()
             return
         }
-
         let cookies = ProxySchemeRequestSupport.responseCookies(from: responseData.headers, fallback: fallbackURL)
         guard !cookies.isEmpty else {
             completion()
             return
         }
+        writeCookiesOnMain(cookies, completion: completion)
+    }
 
-        let group = DispatchGroup()
-        for cookie in cookies {
-            group.enter()
-            cookieStore.setCookie(cookie) {
-                group.leave()
+    /// Writes cookies into the WebView cookie store on the main thread.
+    ///
+    /// `WKWebsiteDataStore.httpCookieStore` and `WKHTTPCookieStore.setCookie` are both
+    /// `@MainActor`-only on iOS 17+. URLSession delegate callbacks (including
+    /// `urlSession(_:task:willPerformHTTPRedirection:newRequest:)`) and the timeout
+    /// closure dispatched via `DispatchQueue.global().asyncAfter` run on background
+    /// queues, so reaching the cookie store from there triggers Main Thread Checker
+    /// warnings and risks runtime crashes in release builds. Hop to main here so all
+    /// `syncResponseCookies` callers stay correct regardless of their own thread context.
+    private func writeCookiesOnMain(_ cookies: [HTTPCookie], completion: @escaping () -> Void) {
+        DispatchQueue.main.async { [weak self] in
+            guard
+                let self,
+                let plugin = self.plugin,
+                let cookieStore = plugin.cookieStore(for: self.webviewId)
+            else {
+                completion()
+                return
             }
-        }
-        group.notify(queue: .main) {
-            completion()
+            let group = DispatchGroup()
+            for cookie in cookies {
+                group.enter()
+                cookieStore.setCookie(cookie) {
+                    group.leave()
+                }
+            }
+            group.notify(queue: .main) {
+                completion()
+            }
         }
     }
 

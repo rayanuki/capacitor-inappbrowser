@@ -1,11 +1,6 @@
 # @capgo/inappbrowser
 
-<a href="https://capgo.app/">
-  <img
-    src="https://raw.githubusercontent.com/Cap-go/capgo/main/assets/capgo_banner.png"
-    alt="Capgo - Instant updates for capacitor"
-  />
-</a>
+<a href="https://capgo.app/"><img src="https://capgo.app/readme-banner.svg?repo=Cap-go/capacitor-inappbrowser" alt="Capgo - Instant updates for Capacitor" /></a>
 
 <div align="center">
   <h2>
@@ -434,6 +429,7 @@ The W3C Payment Request API (used by Google Pay) requires Android WebView 120+. 
 * [`addListener('screenshotTaken', ...)`](#addlistenerscreenshottaken-)
 * [`addListener('browserPageLoaded', ...)`](#addlistenerbrowserpageloaded-)
 * [`addListener('pageLoadError', ...)`](#addlistenerpageloaderror-)
+* [`addListener('customSchemeIntercepted', ...)`](#addlistenercustomschemeintercepted-)
 * [`addListener('downloadCompleted', ...)`](#addlistenerdownloadcompleted-)
 * [`addListener('downloadFailed', ...)`](#addlistenerdownloadfailed-)
 * [`addListener('popupWindowOpened', ...)`](#addlistenerpopupwindowopened-)
@@ -873,6 +869,29 @@ Will be triggered when page load error
 | **`listenerFunc`** | <code>(event: { id?: string; }) =&gt; void</code> |
 
 **Returns:** <code>Promise&lt;<a href="#pluginlistenerhandle">PluginListenerHandle</a>&gt;</code>
+
+--------------------
+
+
+### addListener('customSchemeIntercepted', ...)
+
+```typescript
+addListener(eventName: 'customSchemeIntercepted', listenerFunc: CustomSchemeInterceptedListener) => Promise<PluginListenerHandle>
+```
+
+Will be triggered when the webview intercepts a non-standard custom scheme
+and hands it to the operating system.
+
+Standard OS-handled schemes such as `tel:`, `mailto:`, and `sms:` are excluded.
+
+| Param              | Type                                                                                        |
+| ------------------ | ------------------------------------------------------------------------------------------- |
+| **`eventName`**    | <code>'customSchemeIntercepted'</code>                                                      |
+| **`listenerFunc`** | <code><a href="#customschemeinterceptedlistener">CustomSchemeInterceptedListener</a></code> |
+
+**Returns:** <code>Promise&lt;<a href="#pluginlistenerhandle">PluginListenerHandle</a>&gt;</code>
+
+**Since:** 8.6.7
 
 --------------------
 
@@ -1331,6 +1350,20 @@ Any regex property that is omitted is treated as a wildcard.
 | **`url`** | <code>string</code> | Emit when a button is clicked. | 0.0.1 |
 
 
+#### CustomSchemeInterceptedEvent
+
+Event emitted when the managed webview intercepts a non-standard custom scheme
+and hands it to the operating system.
+
+Standard OS-handled schemes such as `tel:`, `mailto:`, and `sms:` are excluded.
+
+| Prop         | Type                 | Description                                            |
+| ------------ | -------------------- | ------------------------------------------------------ |
+| **`id`**     | <code>string</code>  | Webview instance id.                                   |
+| **`url`**    | <code>string</code>  | Intercepted URL.                                       |
+| **`opened`** | <code>boolean</code> | Whether the operating system accepted the URL handoff. |
+
+
 #### DownloadCompletedEvent
 
 Event emitted after a managed download is saved locally.
@@ -1527,6 +1560,11 @@ Construct a type with a set of properties K of type T
 #### ConfirmBtnListener
 
 <code>(state: <a href="#btnevent">BtnEvent</a>): void</code>
+
+
+#### CustomSchemeInterceptedListener
+
+<code>(state: <a href="#customschemeinterceptedevent">CustomSchemeInterceptedEvent</a>): void</code>
 
 
 #### DownloadHandledBy

@@ -66,7 +66,9 @@ import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
+import androidx.webkit.WebMessageCompat;
 import androidx.webkit.WebSettingsCompat;
+import androidx.webkit.WebViewCompat;
 import androidx.webkit.WebViewFeature;
 import com.caverock.androidsvg.SVG;
 import com.caverock.androidsvg.SVGParseException;
@@ -96,6 +98,7 @@ import java.security.cert.CertificateExpiredException;
 import java.security.cert.CertificateNotYetValidException;
 import java.security.cert.X509Certificate;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -106,6 +109,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -434,22 +438,7 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
 
         @JavascriptInterface
         public void postMessage(String message) {
-            try {
-                // Handle message from JavaScript safely
-                if (message == null || message.isEmpty()) {
-                    Log.e("InAppBrowser", "Received empty message from WebView");
-                    return;
-                }
-
-                if (_options == null || _options.getCallbacks() == null) {
-                    Log.e("InAppBrowser", "Cannot handle postMessage - options or callbacks are null");
-                    return;
-                }
-
-                _options.getCallbacks().javascriptCallback(message);
-            } catch (Exception e) {
-                Log.e("InAppBrowser", "Error in postMessage: " + e.getMessage());
-            }
+            handleJavaScriptPostMessage(message);
         }
 
         @JavascriptInterface
@@ -1873,6 +1862,7 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
         _webView.getSettings().setAllowFileAccessFromFileURLs(true);
         _webView.getSettings().setAllowUniversalAccessFromFileURLs(true);
         _webView.getSettings().setMediaPlaybackRequiresUserGesture(false);
+        injectDocumentStartJavaScriptInterface();
 
         _webView.getSettings().setSupportMultipleWindows(true);
         if (_options.getEnableZoom()) {
@@ -1999,8 +1989,8 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
 
                         // Fixed JavaScript with proper error handling
                         String js = """
-                            try {
-                              (function() {
+                            (function() {
+                              try {
                                 var captureAttr = null;
                                 // Check active element first
                                 if (document.activeElement &&
@@ -2034,11 +2024,11 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
                                   }
                                 }
                                 return '';
-                              })();
-                            } catch(e) {
-                              console.error('Capture detection error:', e);
-                              return '';
-                            }
+                              } catch(e) {
+                                console.error('Capture detection error:', e);
+                                return '';
+                              }
+                            })();
                             """;
 
                         webView.evaluateJavascript(js, (value) -> {
@@ -2597,9 +2587,6 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
         // Check if we need Android 15+ specific fixes
         boolean isAndroid15Plus = Build.VERSION.SDK_INT >= 35;
 
-        // Get parent view
-        ViewGroup parent = (ViewGroup) _webView.getParent();
-
         // Find status bar color view and toolbar for Android 15+ specific handling
         View statusBarColorView = findViewById(R.id.status_bar_color_view);
         View toolbarView = findViewById(R.id.tool_bar);
@@ -2671,42 +2658,29 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
             }
         }
 
-        // Apply system insets to WebView content view (compatible with all Android versions)
-        ViewCompat.setOnApplyWindowInsetsListener(_webView, (v, windowInsets) -> {
+        View coordinatorView = findViewById(R.id.coordinator_layout);
+        final View insetsSourceView = coordinatorView != null ? coordinatorView : _webView;
+
+        // Resolve insets from the dialog root; child WebViews can receive already-fitted zero insets.
+        ViewCompat.setOnApplyWindowInsetsListener(insetsSourceView, (v, windowInsets) -> {
             Insets bars = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars());
             Insets navigationBars = windowInsets.getInsets(WindowInsetsCompat.Type.navigationBars());
             Insets systemGestures = windowInsets.getInsets(WindowInsetsCompat.Type.systemGestures());
             Insets mandatoryGestures = windowInsets.getInsets(WindowInsetsCompat.Type.mandatorySystemGestures());
             Insets ime = windowInsets.getInsets(WindowInsetsCompat.Type.ime());
-            Boolean keyboardVisible = windowInsets.isVisible(WindowInsetsCompat.Type.ime());
+            boolean keyboardVisible = windowInsets.isVisible(WindowInsetsCompat.Type.ime());
 
-            ViewGroup.MarginLayoutParams mlp = (ViewGroup.MarginLayoutParams) v.getLayoutParams();
+            boolean appBarHandlesTopInset =
+                isAndroid15Plus &&
+                !TextUtils.equals(_options.getToolbarType(), "blank") &&
+                toolbarView != null &&
+                toolbarView.getVisibility() == View.VISIBLE &&
+                toolbarView.getParent() instanceof com.google.android.material.appbar.AppBarLayout;
+            applySafeAreaMargins(bars, navigationBars, systemGestures, mandatoryGestures, ime, keyboardVisible, appBarHandlesTopInset);
 
-            // Apply safe margin inset to bottom margin if enabled in options or fallback to 0px
-            int safeBottomInset = Math.max(
-                bars.bottom,
-                Math.max(navigationBars.bottom, Math.max(systemGestures.bottom, mandatoryGestures.bottom))
-            );
-            int navBottom = _options.getEnabledSafeMargin() ? safeBottomInset : 0;
-
-            // Apply top inset based on enabledSafeTopMargin and useTopInset options
-            // If enabledSafeTopMargin is false, force full screen (no top margin)
-            // Otherwise, use useTopInset to determine if system inset should be applied
-            int navTop = _options.getEnabledSafeTopMargin() && _options.getUseTopInset() ? bars.top : 0;
-
-            // Avoid double-applying top inset; AppBar/status bar handled above on Android 15+
-            mlp.topMargin = isAndroid15Plus ? 0 : navTop;
-
-            // Apply larger of navigation bar or keyboard inset to bottom margin
-            mlp.bottomMargin = Math.max(navBottom, ime.bottom);
-
-            mlp.leftMargin = bars.left;
-            mlp.rightMargin = bars.right;
-            v.setLayoutParams(mlp);
-
-            return WindowInsetsCompat.CONSUMED;
+            return windowInsets;
         });
-        ViewCompat.requestApplyInsets(_webView);
+        requestSafeAreaInsets();
 
         // Handle window decoration - version-specific handling
         if (getWindow() != null) {
@@ -2774,6 +2748,58 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
                 }
             }
         }
+
+        requestSafeAreaInsets();
+    }
+
+    private void applySafeAreaMargins(
+        Insets bars,
+        Insets navigationBars,
+        Insets systemGestures,
+        Insets mandatoryGestures,
+        Insets ime,
+        boolean keyboardVisible,
+        boolean appBarHandlesTopInset
+    ) {
+        if (_webView == null || _options == null) {
+            return;
+        }
+
+        ViewGroup.LayoutParams layoutParams = _webView.getLayoutParams();
+        if (!(layoutParams instanceof ViewGroup.MarginLayoutParams mlp)) {
+            return;
+        }
+
+        int safeBottomInset = SafeAreaInsetsSupport.resolveSafeBottomInset(
+            bars.bottom,
+            navigationBars.bottom,
+            systemGestures.bottom,
+            mandatoryGestures.bottom
+        );
+        int imeBottom = keyboardVisible ? ime.bottom : 0;
+        int navTop = SafeAreaInsetsSupport.resolveTopMargin(
+            _options.getEnabledSafeTopMargin(),
+            _options.getUseTopInset(),
+            bars.top,
+            appBarHandlesTopInset
+        );
+
+        mlp.topMargin = navTop;
+        mlp.bottomMargin = SafeAreaInsetsSupport.resolveBottomMargin(_options.getEnabledSafeMargin(), safeBottomInset, imeBottom);
+        mlp.leftMargin = bars.left;
+        mlp.rightMargin = bars.right;
+        _webView.setLayoutParams(mlp);
+    }
+
+    private void requestSafeAreaInsets() {
+        View coordinatorView = findViewById(R.id.coordinator_layout);
+        View insetsSourceView = coordinatorView != null ? coordinatorView : _webView;
+        if (insetsSourceView == null) {
+            return;
+        }
+
+        ViewCompat.requestApplyInsets(insetsSourceView);
+        insetsSourceView.post(() -> ViewCompat.requestApplyInsets(insetsSourceView));
     }
 
     public void postMessageToJS(Object detail) {
@@ -2919,110 +2945,13 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
         }
 
         try {
-            String mobileAppExtras = "";
-            if (isJavaScriptControlAllowed()) {
-                mobileAppExtras = """
-                            , hide: function() {
-                              try {
-                                window.AndroidInterface.hide();
-                              } catch(e) {
-                                console.error('Error in mobileApp.hide:', e);
-                              }
-                            },
-                            show: function() {
-                              try {
-                                window.AndroidInterface.show();
-                              } catch(e) {
-                                console.error('Error in mobileApp.show:', e);
-                              }
-                            }
-                    """;
-            }
-
-            String screenshotBridge =
-                _options != null && _options.getAllowScreenshotsFromWebPage()
-                    ? """
-                          ,
-                          takeScreenshot: function() {
-                            return new Promise(function(resolve, reject) {
-                              try {
-                                if (!nativeBridge.takeScreenshot) {
-                                  reject(new Error('Screenshot bridge is not available'));
-                                  return;
-                                }
-                                var requestId = 'screenshot_' + Date.now() + '_' + Math.random().toString(36).slice(2);
-                                window.__capgoInAppBrowserPendingScreenshots[requestId] = { resolve: resolve, reject: reject };
-                                nativeBridge.takeScreenshot(requestId);
-                              } catch(e) {
-                                reject(e);
-                              }
-                            });
-                          }
-                      """
-                    : "";
-
-            String script = String.format(
-                """
-                (function() {
-                  window.__capgoInAppBrowserPendingScreenshots = window.__capgoInAppBrowserPendingScreenshots || {};
-                  window.__capgoInAppBrowserResolveScreenshot = window.__capgoInAppBrowserResolveScreenshot || function(payload) {
-                    var pending = window.__capgoInAppBrowserPendingScreenshots[payload.requestId];
-                    if (!pending) {
-                      return;
-                    }
-                    delete window.__capgoInAppBrowserPendingScreenshots[payload.requestId];
-                    pending.resolve(payload.result);
-                  };
-                  window.__capgoInAppBrowserRejectScreenshot = window.__capgoInAppBrowserRejectScreenshot || function(payload) {
-                    var pending = window.__capgoInAppBrowserPendingScreenshots[payload.requestId];
-                    if (!pending) {
-                      return;
-                    }
-                    delete window.__capgoInAppBrowserPendingScreenshots[payload.requestId];
-                    pending.reject(new Error(payload.message));
-                  };
-                  // Prefer AndroidInterface when available, otherwise fall back to native window.mobileApp
-                  var nativeBridge = window.AndroidInterface || window.mobileApp;
-                  if (nativeBridge) {
-                    // Wrap native bridge to normalize behavior (stringify objects, expose close/hide/show)
-                    window.mobileApp = {
-                      postMessage: function(message) {
-                        try {
-                          var msg = typeof message === 'string' ? message : JSON.stringify(message);
-                          nativeBridge.postMessage(msg);
-                        } catch(e) {
-                          console.error('Error in mobileApp.postMessage:', e);
-                        }
-                      },
-                      close: function() {
-                        try {
-                          nativeBridge.close();
-                        } catch(e) {
-                          console.error('Error in mobileApp.close:', e);
-                        }
-                      }%s%s
-                    };
-                  }
-                  // Override window.print function to use our PrintInterface
-                  if (window.PrintInterface) {
-                    window.print = function() {
-                      try {
-                        window.PrintInterface.print();
-                      } catch(e) {
-                        console.error('Error in print:', e);
-                      }
-                    };
-                  }
-                })();
-                """,
-                mobileAppExtras,
-                screenshotBridge
-            );
+            String script = createMobileAppBridgeScript();
 
             _webView.post(() -> {
                 if (_webView != null) {
                     try {
                         _webView.evaluateJavascript(script, null);
+                        injectBlankTargetInCurrentWebViewScript();
                     } catch (Exception e) {
                         Log.e("InAppBrowser", "Error injecting JavaScript interface: " + e.getMessage());
                     }
@@ -3030,6 +2959,73 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
             });
         } catch (Exception e) {
             Log.e("InAppBrowser", "Error preparing JavaScript interface: " + e.getMessage());
+        }
+    }
+
+    private void injectDocumentStartJavaScriptInterface() {
+        if (_webView == null) {
+            Log.w("InAppBrowser", "Cannot inject document-start JavaScript interface - WebView is null");
+            return;
+        }
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            Log.d("InAppBrowser", "Document-start JavaScript injection is not supported; using navigation fallback");
+            return;
+        }
+
+        try {
+            injectDocumentStartPostMessageBridge();
+            WebViewCompat.addDocumentStartJavaScript(_webView, createMobileAppBridgeScript(), Collections.singleton("*"));
+        } catch (Exception e) {
+            Log.e("InAppBrowser", "Error injecting document-start JavaScript interface: " + e.getMessage());
+        }
+    }
+
+    private void injectDocumentStartPostMessageBridge() {
+        if (_webView == null) {
+            return;
+        }
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+            Log.d("InAppBrowser", "Document-start postMessage bridge is not supported; using JavaScript interface fallback");
+            return;
+        }
+
+        try {
+            WebViewCompat.addWebMessageListener(
+                _webView,
+                MobileAppBridgeScript.POST_MESSAGE_BRIDGE_NAME,
+                Collections.singleton("*"),
+                (view, message, sourceOrigin, isMainFrame, replyProxy) -> {
+                    if (message == null || message.getType() != WebMessageCompat.TYPE_STRING) {
+                        Log.e("InAppBrowser", "Received unsupported postMessage payload from WebView");
+                        return;
+                    }
+                    handleJavaScriptPostMessage(message.getData());
+                }
+            );
+        } catch (Exception e) {
+            Log.e("InAppBrowser", "Error injecting document-start postMessage bridge: " + e.getMessage());
+        }
+    }
+
+    private String createMobileAppBridgeScript() {
+        return MobileAppBridgeScript.create(isJavaScriptControlAllowed(), _options != null && _options.getAllowScreenshotsFromWebPage());
+    }
+
+    private void handleJavaScriptPostMessage(String message) {
+        try {
+            if (message == null || message.isEmpty()) {
+                Log.e("InAppBrowser", "Received empty message from WebView");
+                return;
+            }
+
+            if (_options == null || _options.getCallbacks() == null) {
+                Log.e("InAppBrowser", "Cannot handle postMessage - options or callbacks are null");
+                return;
+            }
+
+            _options.getCallbacks().javascriptCallback(message);
+        } catch (Exception e) {
+            Log.e("InAppBrowser", "Error in postMessage: " + e.getMessage());
         }
     }
 
@@ -3344,6 +3340,28 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
         if (_webView != null) {
             _webView.destroy();
         }
+    }
+
+    private String getWebViewUrlOnMainThread(String fallbackUrl) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            return getWebViewUrlOrFallback(fallbackUrl);
+        }
+
+        FutureTask<String> task = new FutureTask<>(() -> getWebViewUrlOrFallback(fallbackUrl));
+        mainHandler.post(task);
+        try {
+            return task.get(1, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return fallbackUrl;
+        } catch (Exception e) {
+            return fallbackUrl;
+        }
+    }
+
+    private String getWebViewUrlOrFallback(String fallbackUrl) {
+        String url = _webView != null ? _webView.getUrl() : null;
+        return TextUtils.isEmpty(url) ? fallbackUrl : url;
     }
 
     public String getUrl() {
@@ -3926,12 +3944,124 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
         return false;
     }
 
+    private String buildAuthorizedHostsJson(List<String> authorizedLinks) {
+        if (authorizedLinks == null || authorizedLinks.isEmpty()) {
+            return "[]";
+        }
+
+        StringBuilder hostsJson = new StringBuilder("[");
+        boolean hasHost = false;
+        for (String authorized : authorizedLinks) {
+            if (authorized == null) {
+                continue;
+            }
+
+            try {
+                URI authUri = new URI(authorized);
+                String host = authUri.getHost();
+                if (host == null) {
+                    continue;
+                }
+
+                if (host.startsWith("www.")) {
+                    host = host.substring(4);
+                }
+
+                if (hasHost) {
+                    hostsJson.append(",");
+                }
+                hostsJson.append(JSONObject.quote(host.toLowerCase(Locale.ROOT)));
+                hasHost = true;
+            } catch (URISyntaxException e) {
+                Log.e("InAppBrowser", "Skipping invalid authorized app link: " + authorized, e);
+            }
+        }
+
+        hostsJson.append("]");
+        return hostsJson.toString();
+    }
+
+    private void injectBlankTargetInCurrentWebViewScript() {
+        if (_webView == null || _options == null || (!_options.getPreventDeeplink() && !_options.getOpenBlankTargetInWebView())) {
+            return;
+        }
+
+        String authorizedHostsJson = buildAuthorizedHostsJson(_options.getAuthorizedAppLinks());
+        String preventDeeplink = _options.getPreventDeeplink() ? "true" : "false";
+        String script = String.format(
+            Locale.US,
+            """
+            (function() {
+              if (window.__capgoInAppBrowserBlankTargetInCurrentWebView) {
+                return;
+              }
+              window.__capgoInAppBrowserBlankTargetInCurrentWebView = true;
+
+              var authorizedHosts = new Set(%s);
+              var preventDeeplink = %s;
+              var normalizeHost = function(host) {
+                return (host || '').replace(/^www\\./i, '').toLowerCase();
+              };
+
+              document.addEventListener('click', function(event) {
+                if (event.defaultPrevented) {
+                  return;
+                }
+
+                var element = event.target;
+                if (!element || typeof element.closest !== 'function') {
+                  return;
+                }
+
+                var anchor = element.closest('a[target][href]');
+                if (!anchor || (anchor.getAttribute('target') || '').toLowerCase() !== '_blank') {
+                  return;
+                }
+
+                var nextUrl;
+                try {
+                  nextUrl = new URL(anchor.href);
+                } catch (_) {
+                  return;
+                }
+
+                var protocol = nextUrl.protocol.toLowerCase();
+                if (protocol !== 'http:' && protocol !== 'https:') {
+                  return;
+                }
+
+                if (!preventDeeplink && authorizedHosts.has(normalizeHost(nextUrl.hostname))) {
+                  return;
+                }
+
+                event.preventDefault();
+                setTimeout(function() {
+                  window.location.assign(nextUrl.toString());
+                }, 0);
+              });
+            })();
+            """,
+            authorizedHostsJson,
+            preventDeeplink
+        );
+
+        _webView.post(() -> {
+            if (_webView != null) {
+                try {
+                    _webView.evaluateJavascript(script, null);
+                } catch (Exception e) {
+                    Log.e("InAppBrowser", "Error injecting blank target handler: " + e.getMessage());
+                }
+            }
+        });
+    }
+
     private boolean shouldLoadBlankTargetInCurrentWebView(String url) {
         if (!isHttpOrHttpsUrl(url)) {
             return false;
         }
 
-        if (isAuthorizedAppLink(url, _options.getAuthorizedAppLinks())) {
+        if (!_options.getPreventDeeplink() && isAuthorizedAppLink(url, _options.getAuthorizedAppLinks())) {
             return false;
         }
 
@@ -4138,6 +4268,7 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
                     }
 
                     if (isNotHttpOrHttps) {
+                        boolean shouldEmitCustomSchemeEvent = CustomSchemeInterceptSupport.shouldEmitInterceptEvent(url);
                         try {
                             Intent intent;
                             if (url.startsWith("intent:")) {
@@ -4147,8 +4278,22 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
                             }
                             intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                             context.startActivity(intent);
+                            if (shouldEmitCustomSchemeEvent && _options.getCallbacks() != null) {
+                                _options.getCallbacks().customSchemeIntercepted(url, true);
+                            }
                             return true;
-                        } catch (ActivityNotFoundException | URISyntaxException e) {
+                        } catch (ActivityNotFoundException e) {
+                            Log.w("InAppBrowser", "No handler for external URL: " + url, e);
+                            if (shouldEmitCustomSchemeEvent && _options.getCallbacks() != null) {
+                                _options.getCallbacks().customSchemeIntercepted(url, false);
+                            }
+                            // Notify that a page load error occurred
+                            if (_options.getCallbacks() != null && request.isForMainFrame()) {
+                                _options.getCallbacks().pageLoadError();
+                                rejectOpenWebViewIfNeeded("No handler available for external URL: " + url);
+                            }
+                            return true; // prevent WebView from attempting to load the custom scheme
+                        } catch (URISyntaxException e) {
                             Log.w("InAppBrowser", "No handler for external URL: " + url, e);
                             // Notify that a page load error occurred
                             if (_options.getCallbacks() != null && request.isForMainFrame()) {
@@ -4311,7 +4456,7 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
                         }
                         String initiatorUrl = request.getRequestHeaders().get("Referer");
                         if (initiatorUrl == null || initiatorUrl.isBlank()) {
-                            initiatorUrl = _webView.getUrl();
+                            initiatorUrl = getWebViewUrlOnMainThread(originalUrl);
                         }
                         String targetCookies = CookieManager.getInstance().getCookie(originalUrl);
                         if (
@@ -4354,6 +4499,7 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
                         _options,
                         requestContext.url
                     );
+                    NativeResponseData directResponseData = null;
 
                     NativeProxyRule outboundRule =
                         legacyProxyMode && shouldDelegateLegacyRequest
@@ -4405,7 +4551,11 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
                                 if (proxiedRequest.response != null) {
                                     return proxiedRequest.response;
                                 }
-                                requestContext = proxiedRequest.requestContext != null ? proxiedRequest.requestContext : requestContext;
+                                if (proxiedRequest.nativeResponse != null) {
+                                    directResponseData = proxiedRequest.nativeResponse;
+                                } else {
+                                    requestContext = proxiedRequest.requestContext != null ? proxiedRequest.requestContext : requestContext;
+                                }
                             } else {
                                 synchronized (proxiedRequest) {
                                     proxiedRequest.timedOut = true;
@@ -4421,12 +4571,14 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
                         }
                     }
 
-                    NativeResponseData nativeResponse;
-                    try {
-                        nativeResponse = performNativeRequest(requestContext);
-                    } catch (IOException error) {
-                        Log.e("InAppBrowserProxy", "Native request failed for: " + requestContext.url, error);
-                        return bridgeBackedRequest ? createCanceledResponse() : null;
+                    NativeResponseData nativeResponse = directResponseData;
+                    if (nativeResponse == null) {
+                        try {
+                            nativeResponse = performNativeRequest(requestContext);
+                        } catch (IOException error) {
+                            Log.e("InAppBrowserProxy", "Native request failed for: " + requestContext.url, error);
+                            return bridgeBackedRequest ? createCanceledResponse() : null;
+                        }
                     }
 
                     int redirectsFollowed = 0;
@@ -4446,7 +4598,7 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
                                 redirectsFollowed++;
                                 continue;
                             }
-                            return buildWebResourceResponse(nativeResponse);
+                            return createWebResourceResponseOrFallback(nativeResponse, bridgeBackedRequest, requestContext.url);
                         }
                         if (inboundRule.getAction() == NativeProxyRule.Action.CANCEL) {
                             return createCanceledResponse();
@@ -4482,6 +4634,9 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
                                 if (proxiedRequest.response != null) {
                                     return proxiedRequest.response;
                                 }
+                                if (proxiedRequest.nativeResponse != null) {
+                                    nativeResponse = proxiedRequest.nativeResponse;
+                                }
                             } else {
                                 synchronized (proxiedRequest) {
                                     proxiedRequest.timedOut = true;
@@ -4506,7 +4661,7 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
                             redirectsFollowed++;
                             continue;
                         }
-                        return buildWebResourceResponse(nativeResponse);
+                        return createWebResourceResponseOrFallback(nativeResponse, bridgeBackedRequest, requestContext.url);
                     }
                 }
 
@@ -5359,8 +5514,35 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
         return response;
     }
 
+    private WebResourceResponse createWebResourceResponseOrFallback(
+        NativeResponseData responseData,
+        boolean bridgeBackedRequest,
+        String requestUrl
+    ) {
+        WebResourceResponse response = buildWebResourceResponse(responseData);
+        if (response != null) {
+            return response;
+        }
+
+        // Android WebResourceResponse rejects 3xx statuses; let the original WebView request handle them.
+        if (ProxyRequestSupport.shouldFallbackToWebViewForUnsupportedStatus(bridgeBackedRequest, responseData.statusCode)) {
+            Log.w(
+                "InAppBrowserProxy",
+                "Allowing WebView to handle unsupported proxy response status " + responseData.statusCode + " for: " + requestUrl
+            );
+            return null;
+        }
+
+        Log.w("InAppBrowserProxy", "Canceling bridge proxy response with unsupported status: " + responseData.statusCode);
+        return createCanceledResponse();
+    }
+
     private WebResourceResponse buildWebResourceResponse(NativeResponseData responseData) {
-        ProxyRequestSupport.WebResourceResponseMetadata metadata = ProxyRequestSupport.resolveWebResourceResponseMetadata(
+        if (!ProxyRequestSupport.supportsWebResourceResponseStatus(responseData.statusCode)) {
+            return null;
+        }
+
+        ProxyRequestSupport.WebResourceResponseMetadata metadata = ProxyRequestSupport.resolveWebResourceResponseConstructorMetadata(
             responseData.contentType,
             responseData.headers
         );
@@ -5436,7 +5618,10 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
             conn.setRequestMethod(requestContext.method != null ? requestContext.method : "GET");
             conn.setInstanceFollowRedirects(false);
 
-            for (Map.Entry<String, String> entry : requestContext.headers.entrySet()) {
+            // Strip conditional cache validators on the wire so upstream cannot return 304/3xx,
+            // which WebResourceResponse.setStatusCodeAndReasonPhrase rejects (kills the renderer).
+            Map<String, String> wireHeaders = ProxyRequestSupport.stripCacheValidatorHeaders(requestContext.headers);
+            for (Map.Entry<String, String> entry : wireHeaders.entrySet()) {
                 conn.setRequestProperty(entry.getKey(), entry.getValue());
             }
 
@@ -5577,7 +5762,7 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
                 }
 
                 JSObject responseOverride = response.getJSObject("response");
-                if (responseOverride == null && response.get("status") != null) {
+                if (responseOverride == null && response.has("status")) {
                     responseOverride = response;
                 }
 
@@ -5840,17 +6025,13 @@ public class WebViewDialog extends Dialog implements ProxyResponseRouting.ProxyR
     public void setEnabledSafeTopMargin(boolean enabled) {
         if (_options.getEnabledSafeTopMargin() == enabled) return;
         _options.setEnabledSafeTopMargin(enabled);
-        if (_webView != null) {
-            ViewCompat.requestApplyInsets(_webView);
-        }
+        requestSafeAreaInsets();
     }
 
     public void setEnabledSafeBottomMargin(boolean enabled) {
         if (_options.getEnabledSafeMargin() == enabled) return;
         _options.setEnabledSafeMargin(enabled);
-        if (_webView != null) {
-            ViewCompat.requestApplyInsets(_webView);
-        }
+        requestSafeAreaInsets();
     }
 
     /**
