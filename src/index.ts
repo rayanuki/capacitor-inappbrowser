@@ -1,17 +1,105 @@
-import { registerPlugin } from '@capacitor/core';
+import { Capacitor, registerPlugin } from '@capacitor/core';
 import type { PluginListenerHandle } from '@capacitor/core';
 
+import {
+  containsPathTraversal,
+  isRelativeBundledPath,
+  parseBundledLocalConfig,
+  resolveLegacyNativeWebViewUrl,
+  type BundledAssetPlatform,
+} from './bundled-asset-support';
 import type {
   InAppBrowserPlugin,
+  OpenWebViewOptions,
   ProxyDecision,
   ProxyHandler,
   ProxyRequestOverride,
   ProxyResponse,
 } from './definitions';
 
-const InAppBrowser = registerPlugin<InAppBrowserPlugin>('InAppBrowser', {
+const CAPGO_PLUGIN_NAME = 'CapgoInAppBrowser';
+const PREVIOUS_PLUGIN_NAME = 'InAppBrowser';
+
+function resolvePluginName(): string {
+  if (!Capacitor.isNativePlatform()) {
+    return CAPGO_PLUGIN_NAME;
+  }
+
+  if (Capacitor.isPluginAvailable(CAPGO_PLUGIN_NAME)) {
+    return CAPGO_PLUGIN_NAME;
+  }
+
+  if (Capacitor.isPluginAvailable(PREVIOUS_PLUGIN_NAME)) {
+    return PREVIOUS_PLUGIN_NAME;
+  }
+
+  console.warn(
+    `[InAppBrowser] Neither '${CAPGO_PLUGIN_NAME}' nor '${PREVIOUS_PLUGIN_NAME}' native plugin detected. ` +
+      'Ensure @capgo/capacitor-inappbrowser native code is installed.',
+  );
+  return CAPGO_PLUGIN_NAME;
+}
+
+const inAppBrowserImplementations = {
   web: () => import('./web').then((m) => new m.InAppBrowserWeb()),
-});
+};
+
+function assertValidBundledAssetPath(url: string): void {
+  if (isRelativeBundledPath(url) && containsPathTraversal(url)) {
+    throw new Error('Invalid bundled asset path');
+  }
+}
+
+const activePluginName = resolvePluginName();
+
+function bundledAssetPlatform(): BundledAssetPlatform {
+  return Capacitor.getPlatform() === 'ios' ? 'ios' : 'android';
+}
+
+function getConfiguredLocalConfig() {
+  if (!Capacitor.isNativePlatform()) {
+    return null;
+  }
+
+  const getServerUrl = (Capacitor as { getServerUrl?: () => string }).getServerUrl;
+  if (typeof getServerUrl !== 'function') {
+    return null;
+  }
+
+  return parseBundledLocalConfig(getServerUrl());
+}
+
+function prepareUrlOptions<T extends { url: string }>(options: T): T {
+  assertValidBundledAssetPath(options.url);
+
+  if (!Capacitor.isNativePlatform() || activePluginName !== PREVIOUS_PLUGIN_NAME) {
+    return options;
+  }
+
+  return {
+    ...options,
+    url: resolveLegacyNativeWebViewUrl(options.url, bundledAssetPlatform(), getConfiguredLocalConfig()),
+  };
+}
+
+const baseInAppBrowser = registerPlugin<InAppBrowserPlugin>(activePluginName, inAppBrowserImplementations);
+
+const InAppBrowser = new Proxy(baseInAppBrowser, {
+  get(target, prop, receiver) {
+    if (prop === 'openWebView') {
+      return (options: OpenWebViewOptions) => target.openWebView(prepareUrlOptions(options));
+    }
+    if (prop === 'setUrl') {
+      return (options: Parameters<InAppBrowserPlugin['setUrl']>[0]) => target.setUrl(prepareUrlOptions(options));
+    }
+
+    const value = Reflect.get(target, prop, receiver);
+    if (typeof value === 'function') {
+      return value.bind(target);
+    }
+    return value;
+  },
+}) as InAppBrowserPlugin;
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer);

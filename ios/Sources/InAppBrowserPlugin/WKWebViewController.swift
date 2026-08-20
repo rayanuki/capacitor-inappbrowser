@@ -16,7 +16,7 @@ private let cookieKey = "Cookie"
 
 enum CustomSchemeInterceptSupport {
     static let standardHandledSchemes = ["tel", "mailto", "sms"]
-    private static let webSchemes = ["http", "https", "file"]
+    private static let webSchemes = ["http", "https", "file", "data"]
 
     static func shouldEmitInterceptEvent(for url: URL) -> Bool {
         guard let scheme = url.scheme?.lowercased(), !scheme.isEmpty else {
@@ -40,6 +40,49 @@ private struct WKDownloadState {
 private enum DownloadReservationStore {
     static var paths: Set<String> = []
     static let lock = NSLock()
+}
+
+private enum BlobDownloadSupport {
+    static let maxLegacyBytes = 512 * 1024
+    static let chunkBytes = 64 * 1024
+}
+
+/// Script message handlers registered on every in-app browser WKWebView.
+/// Popup configs from `createWebViewWith` copy parent handlers, so we must
+/// remove these names before re-adding or WKWebView raises NSInvalidArgumentException.
+enum ScriptMessageHandlerSupport {
+    static let allNames = [
+        "messageHandler",
+        "preShowScriptError",
+        "preShowScriptSuccess",
+        "close",
+        "hide",
+        "show",
+        "blobDownload",
+        "blobDownloadStart",
+        "blobDownloadChunk",
+        "blobDownloadFinish",
+        "blobDownloadAbort",
+        "takeScreenshot",
+        "consoleMessageHandler",
+        "magicPrint",
+        "capgoProxyBridge"
+    ]
+
+    static func removeAll(from userContentController: WKUserContentController) {
+        for name in allNames {
+            userContentController.removeScriptMessageHandler(forName: name)
+        }
+    }
+}
+
+private struct BlobDownloadSession {
+    let destinationURL: URL
+    let sourceURL: String?
+    let mimeType: String?
+    let fileHandle: FileHandle
+    let expectedSize: Int64?
+    var bytesWritten: Int64 = 0
 }
 
 public struct WKWebViewCredentials {
@@ -226,6 +269,59 @@ enum ConsoleMessageSupport {
     }
 }
 
+enum WebViewViewportLayoutSupport {
+    static func shouldRefreshViewport(previousSize: CGSize?, currentSize: CGSize, force: Bool = false) -> Bool {
+        guard currentSize.width > 0, currentSize.height > 0 else {
+            return false
+        }
+
+        return force || previousSize != currentSize
+    }
+}
+
+enum WebViewSafeAreaLayoutSupport {
+    static func contentInsetAdjustmentBehavior(enabledSafeBottomMargin: Bool) -> UIScrollView.ContentInsetAdjustmentBehavior {
+        enabledSafeBottomMargin ? .automatic : .never
+    }
+
+    static func shouldInsetLayoutMarginsFromSafeArea(enabledSafeBottomMargin: Bool) -> Bool {
+        enabledSafeBottomMargin
+    }
+
+    static func rawSystemBottomInset(effectiveBottomInset: CGFloat, additionalBottomInset: CGFloat) -> CGFloat {
+        max(0, effectiveBottomInset - additionalBottomInset)
+    }
+
+    static func additionalBottomSafeAreaOffset(enabledSafeBottomMargin: Bool, safeAreaBottomInset: CGFloat) -> CGFloat {
+        guard !enabledSafeBottomMargin, safeAreaBottomInset > 0 else {
+            return 0
+        }
+
+        return -safeAreaBottomInset
+    }
+
+    static func cssBottomInset(enabledSafeBottomMargin: Bool, safeAreaBottomInset: CGFloat) -> CGFloat {
+        enabledSafeBottomMargin ? safeAreaBottomInset : 0
+    }
+
+    static func cssTopInset(enabledSafeTopMargin: Bool, safeAreaTopInset: CGFloat) -> CGFloat {
+        enabledSafeTopMargin ? safeAreaTopInset : 0
+    }
+
+    static func safeAreaCssVariablesScript(top: CGFloat, bottom: CGFloat, left: CGFloat, right: CGFloat) -> String {
+        let topValue = Int(top.rounded())
+        let bottomValue = Int(bottom.rounded())
+        let leftValue = Int(left.rounded())
+        let rightValue = Int(right.rounded())
+
+        return "(function(){var root=document.documentElement;" +
+            "root.style.setProperty('--safe-area-inset-top','\(topValue)px');" +
+            "root.style.setProperty('--safe-area-inset-bottom','\(bottomValue)px');" +
+            "root.style.setProperty('--safe-area-inset-left','\(leftValue)px');" +
+            "root.style.setProperty('--safe-area-inset-right','\(rightValue)px');})();"
+    }
+}
+
 open class WKWebViewController: UIViewController, WKScriptMessageHandler {
 
     public init() {
@@ -301,7 +397,7 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
         self.initWebview(isInspectable: isInspectable)
     }
 
-    public init(url: URL, headers: [String: String], isInspectable: Bool, credentials: WKWebViewCredentials? = nil, preventDeeplink: Bool, blankNavigationTab: Bool, enabledSafeBottomMargin: Bool, enabledSafeTopMargin: Bool = true, blockedHosts: [String], authorizedAppLinks: [String], allowWebViewJsVisibilityControl: Bool = false, allowScreenshotsFromWebPage: Bool = false, captureConsoleLogs: Bool = false, proxyRequests: Bool = false, proxySchemeHandler: ProxySchemeHandler? = nil, documentStartUserScripts: [String] = [], openBlankTargetInWebView: Bool = false) {
+    public init(url: URL, headers: [String: String], isInspectable: Bool, credentials: WKWebViewCredentials? = nil, preventDeeplink: Bool, blankNavigationTab: Bool, enabledSafeBottomMargin: Bool, enabledSafeTopMargin: Bool = true, blockedHosts: [String], authorizedAppLinks: [String], allowWebViewJsVisibilityControl: Bool = false, allowScreenshotsFromWebPage: Bool = false, captureConsoleLogs: Bool = false, proxyRequests: Bool = false, proxySchemeHandler: ProxySchemeHandler? = nil, proxyBridge: ProxyBridge? = nil, proxyBridgeAccessToken: String? = nil, legacyProxyRequestURLRegexPattern: String? = nil, documentStartUserScripts: [String] = [], openBlankTargetInWebView: Bool = false) {
         super.init(nibName: nil, bundle: nil)
         self.blankNavigationTab = blankNavigationTab
         self.enabledSafeBottomMargin = enabledSafeBottomMargin
@@ -313,6 +409,9 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
         self.captureConsoleLogs = captureConsoleLogs
         self.proxyRequests = proxyRequests
         self.proxySchemeHandler = proxySchemeHandler
+        self.proxyBridge = proxyBridge
+        self.proxyBridgeAccessToken = proxyBridgeAccessToken
+        self.legacyProxyRequestURLRegexPattern = legacyProxyRequestURLRegexPattern
         self.openBlankTargetInWebView = openBlankTargetInWebView
         self.setHeaders(headers: headers)
         self.setPreventDeeplink(preventDeeplink: preventDeeplink)
@@ -331,6 +430,8 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
     open var allowWebViewJsVisibilityControl = false
     open var allowScreenshotsFromWebPage = false
     open var captureConsoleLogs = false
+    open var persistWebViewData = true
+    open var useSharedDataStore = false
     open var handleDownloads = false
     open var delegate: WKWebViewControllerDelegate?
     open var bypassedSSLHosts: [String]?
@@ -338,15 +439,18 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
     open var headers: [String: String]?
     open var httpMethod: String?
     open var httpBody: String?
-    open var capBrowserPlugin: InAppBrowserPlugin?
+    open var capBrowserPlugin: CapgoInAppBrowserPlugin?
+    open var isInspectable: Bool = false
     var instanceId: String = ""
     var shareDisclaimer: [String: Any]?
     var shareSubject: String?
     var didpageInit = false
-    var viewHeightLandscape: CGFloat?
-    var viewHeightPortrait: CGFloat?
-    var currentViewHeight: CGFloat?
     open var closeModal = false
+    open var closeAction = "close"
+    open var screenshotOnHide = false
+    var toolbarHideInProgress = false
+    open var titleFontFamily: String?
+    open var titleIcon: UIImage?
     open var closeModalTitle = ""
     open var closeModalDescription = ""
     open var closeModalOk = ""
@@ -369,13 +473,27 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
     var blockedHosts: [String] = []
     var authorizedAppLinks: [String] = []
     var activeNativeNavigationForWebview: Bool = true
+    var enableReloadGesture: Bool = false
+    var pendingReloadFromGesture = false
+    var reloadFromGestureInProgress = false
+    var reloadGestureNavigation: WKNavigation?
+    var reloadGestureArmedPullDistance: CGFloat = 0
+    var reloadPanObserverInstalled = false
     var disableOverscroll: Bool = false
     var proxyRequests: Bool = false
     var proxySchemeHandler: ProxySchemeHandler?
+    var bundledAssetSchemeHandler: BundledAssetSchemeHandler?
+    var bundledAssetLocalScheme: String = BundledAssetSupport.iosDefaults.scheme
+    var bundledAssetLocalHost: String = BundledAssetSupport.iosDefaults.host
+    var proxyBridge: ProxyBridge?
+    var proxyBridgeAccessToken: String?
+    var legacyProxyRequestURLRegexPattern: String?
     var initialWebConfiguration: WKWebViewConfiguration?
     var waitsForPopupNavigation = false
     var hiddenPopupWindow = false
     var opensHidden = false
+    var isLayeredBehind = false
+    var transparentHostBackground = true
 
     // Dimension properties
     var customWidth: CGFloat?
@@ -383,10 +501,26 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
     var customX: CGFloat?
     var customY: CGFloat?
 
+    /// Front (non-toBack) browsers with a custom height use a framed child overlay.
+    var shouldPresentAsFramedOverlay: Bool {
+        !isLayeredBehind && customHeight != nil
+    }
+
     internal var preShowSemaphore: DispatchSemaphore?
     internal var preShowError: String?
     private var isWebViewInitialized = false
+    private var isObservingKeyboardViewportChanges = false
+    private var lastViewportRefreshSize: CGSize?
+    private struct InjectedSafeAreaInsets: Equatable {
+        let top: Int
+        let bottom: Int
+        let left: Int
+        let right: Int
+    }
+
+    private var lastInjectedSafeAreaInsets: InjectedSafeAreaInsets?
     private var downloadStates: [ObjectIdentifier: WKDownloadState] = [:]
+    private var blobDownloadSessions: [String: BlobDownloadSession] = [:]
     private var previewItemURL: URL?
 
     func setHeaders(headers: [String: String]) {
@@ -427,15 +561,30 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
             return nil
         }
 
-        return httpResponse.value(forHTTPHeaderField: "Content-Disposition")
+        if let value = httpResponse.value(forHTTPHeaderField: "Content-Disposition"),
+           !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return value
+        }
+
+        for (key, value) in httpResponse.allHeaderFields {
+            guard let headerName = key as? String,
+                  headerName.lowercased() == "content-disposition",
+                  let headerValue = value as? String,
+                  !headerValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                continue
+            }
+            return headerValue
+        }
+
+        return nil
     }
 
     private func attachmentDispositionType(_ response: URLResponse) -> String? {
         guard let disposition = attachmentDisposition(response)?
-            .split(separator: ";", maxSplits: 1)
-            .first?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased(),
+                .split(separator: ";", maxSplits: 1)
+                .first?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased(),
               !disposition.isEmpty else {
             return nil
         }
@@ -527,7 +676,7 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
             "application/download",
             "application/x-download",
             "application/binary",
-            "application/x-binary",
+            "application/x-binary"
         ]
 
         if let candidate, !candidate.isEmpty, !genericMimeTypes.contains(candidate) {
@@ -590,7 +739,7 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
             "fileName": fileURL.lastPathComponent,
             "path": fileURL.path,
             "localUrl": fileURL.absoluteString,
-            "handledBy": handledBy,
+            "handledBy": handledBy
         ]
         if let sourceURL {
             data["sourceUrl"] = sourceURL
@@ -634,6 +783,329 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
         }
     }
 
+    private func parseBlobBridgePayload(_ payload: Any) -> [String: Any]? {
+        if let dictionary = payload as? [String: Any] {
+            return dictionary
+        }
+
+        if let jsonString = payload as? String,
+           let data = jsonString.data(using: .utf8),
+           let dictionary = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            return dictionary
+        }
+
+        return nil
+    }
+
+    private func blobDownloadFileName(from payload: [String: Any], fallback: String = "download") -> String {
+        sanitizeDownloadFilename(payload["fileName"] as? String ?? fallback)
+    }
+
+    private func cleanupBlobDownloadSession(_ session: BlobDownloadSession?, deleteFile: Bool) {
+        guard let session else {
+            return
+        }
+
+        try? session.fileHandle.close()
+        if deleteFile {
+            try? FileManager.default.removeItem(at: session.destinationURL)
+            releaseDownloadDestination(session.destinationURL)
+        }
+    }
+
+    @discardableResult
+    private func abortBlobDownloadSession(sessionId: String, deleteFile: Bool) -> BlobDownloadSession? {
+        guard let session = blobDownloadSessions.removeValue(forKey: sessionId) else {
+            return nil
+        }
+        cleanupBlobDownloadSession(session, deleteFile: deleteFile)
+        return session
+    }
+
+    private func handleLegacyBlobDownloadPayload(_ payload: Any) {
+        guard handleDownloads else {
+            return
+        }
+
+        guard let jsonPayload = parseBlobBridgePayload(payload) else {
+            emitDownloadFailed(sourceURL: nil, error: "Blob download payload is missing")
+            return
+        }
+
+        let base64 = jsonPayload["base64"] as? String ?? ""
+        guard !base64.isEmpty else {
+            emitDownloadFailed(sourceURL: jsonPayload["sourceUrl"] as? String, error: "Blob download payload is empty")
+            return
+        }
+
+        let declaredSize = (jsonPayload["size"] as? NSNumber)?.int64Value
+        let estimatedSize = Int64((Double(base64.count) * 3.0 / 4.0).rounded(.up))
+        let decodedSize = max(declaredSize ?? estimatedSize, estimatedSize)
+        if decodedSize > Int64(BlobDownloadSupport.maxLegacyBytes) {
+            emitDownloadFailed(
+                sourceURL: jsonPayload["sourceUrl"] as? String,
+                fileName: blobDownloadFileName(from: jsonPayload),
+                mimeType: jsonPayload["mimeType"] as? String,
+                error: "Blob download is too large for the legacy bridge"
+            )
+            return
+        }
+
+        do {
+            guard let data = Data(base64Encoded: base64) else {
+                throw NSError(domain: "InAppBrowser", code: 1, userInfo: [NSLocalizedDescriptionKey: "Blob download payload is invalid"])
+            }
+
+            let fileName = blobDownloadFileName(from: jsonPayload)
+            let destinationURL = try uniqueDownloadDestination(for: fileName)
+            try data.write(to: destinationURL, options: .atomic)
+            let mimeType = jsonPayload["mimeType"] as? String
+            let sourceURL = jsonPayload["sourceUrl"] as? String
+            previewDownloadedFile(destinationURL, mimeType: mimeType, sourceURL: sourceURL)
+        } catch {
+            emitDownloadFailed(
+                sourceURL: jsonPayload["sourceUrl"] as? String,
+                fileName: blobDownloadFileName(from: jsonPayload),
+                mimeType: jsonPayload["mimeType"] as? String,
+                error: "Failed to save blob download: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func startBlobDownloadPayload(_ payload: Any) {
+        guard handleDownloads else {
+            return
+        }
+
+        do {
+            guard let jsonPayload = parseBlobBridgePayload(payload) else {
+                throw NSError(domain: "InAppBrowser", code: 1, userInfo: [NSLocalizedDescriptionKey: "Blob download start payload is missing"])
+            }
+
+            let sessionId = jsonPayload["sessionId"] as? String ?? ""
+            guard !sessionId.isEmpty else {
+                throw NSError(domain: "InAppBrowser", code: 1, userInfo: [NSLocalizedDescriptionKey: "Blob download session id is missing"])
+            }
+
+            if blobDownloadSessions[sessionId] != nil {
+                throw NSError(domain: "InAppBrowser", code: 1, userInfo: [NSLocalizedDescriptionKey: "Blob download session already exists"])
+            }
+
+            let fileName = blobDownloadFileName(from: jsonPayload)
+            let destinationURL = try uniqueDownloadDestination(for: fileName)
+            let fileHandle = try FileHandle(forWritingTo: destinationURL)
+            let expectedSize = (jsonPayload["size"] as? NSNumber)?.int64Value
+            blobDownloadSessions[sessionId] = BlobDownloadSession(
+                destinationURL: destinationURL,
+                sourceURL: jsonPayload["sourceUrl"] as? String,
+                mimeType: jsonPayload["mimeType"] as? String,
+                fileHandle: fileHandle,
+                expectedSize: expectedSize
+            )
+        } catch {
+            emitDownloadFailed(sourceURL: nil, error: "Failed to start blob download: \(error.localizedDescription)")
+        }
+    }
+
+    private func appendBlobDownloadChunkPayload(_ payload: Any) {
+        guard handleDownloads else {
+            return
+        }
+
+        guard let jsonPayload = parseBlobBridgePayload(payload),
+              let sessionId = jsonPayload["sessionId"] as? String,
+              !sessionId.isEmpty,
+              var session = blobDownloadSessions[sessionId] else {
+            return
+        }
+
+        let base64 = jsonPayload["base64"] as? String ?? ""
+        guard !base64.isEmpty, let data = Data(base64Encoded: base64) else {
+            abortBlobDownloadSession(sessionId: sessionId, deleteFile: true)
+            emitDownloadFailed(sourceURL: session.sourceURL, error: "Failed to save blob download")
+            return
+        }
+
+        do {
+            if let expectedSize = session.expectedSize, session.bytesWritten + Int64(data.count) > expectedSize {
+                throw NSError(domain: "InAppBrowser", code: 1, userInfo: [NSLocalizedDescriptionKey: "Blob download exceeded expected size"])
+            }
+
+            try session.fileHandle.write(contentsOf: data)
+            session.bytesWritten += Int64(data.count)
+            blobDownloadSessions[sessionId] = session
+        } catch {
+            abortBlobDownloadSession(sessionId: sessionId, deleteFile: true)
+            emitDownloadFailed(sourceURL: session.sourceURL, error: "Failed to save blob download: \(error.localizedDescription)")
+        }
+    }
+
+    private func finishBlobDownloadPayload(_ payload: Any) {
+        guard handleDownloads else {
+            return
+        }
+
+        guard let jsonPayload = parseBlobBridgePayload(payload),
+              let sessionId = jsonPayload["sessionId"] as? String,
+              !sessionId.isEmpty,
+              let session = blobDownloadSessions.removeValue(forKey: sessionId) else {
+            emitDownloadFailed(sourceURL: nil, error: "Blob download session was not initialized")
+            return
+        }
+
+        defer {
+            try? session.fileHandle.close()
+        }
+
+        if let expectedSize = session.expectedSize, session.bytesWritten != expectedSize {
+            cleanupBlobDownloadSession(session, deleteFile: true)
+            emitDownloadFailed(
+                sourceURL: session.sourceURL,
+                fileName: session.destinationURL.lastPathComponent,
+                mimeType: session.mimeType,
+                error: "Blob download size mismatch"
+            )
+            return
+        }
+
+        previewDownloadedFile(session.destinationURL, mimeType: session.mimeType, sourceURL: session.sourceURL)
+    }
+
+    private func abortBlobDownloadPayload(_ payload: Any) {
+        guard handleDownloads else {
+            return
+        }
+
+        let jsonPayload = parseBlobBridgePayload(payload)
+        let sessionId = jsonPayload?["sessionId"] as? String ?? ""
+        let session = abortBlobDownloadSession(sessionId: sessionId, deleteFile: true)
+        let reason = jsonPayload?["reason"] as? String ?? "Blob download aborted"
+        emitDownloadFailed(
+            sourceURL: session?.sourceURL ?? jsonPayload?["sourceUrl"] as? String,
+            fileName: session?.destinationURL.lastPathComponent ?? jsonPayload?["fileName"] as? String,
+            mimeType: session?.mimeType ?? jsonPayload?["mimeType"] as? String,
+            error: reason
+        )
+    }
+
+    private func handleBlobDownloadFromPage(blobUrl: String, mimeType: String?, contentDisposition: String?) {
+        guard handleDownloads, let webView else {
+            emitDownloadFailed(sourceURL: blobUrl, error: "Blob download requires an active WebView")
+            return
+        }
+
+        let fallbackMimeType = normalizedMimeType(mimeType, fileURL: URL(fileURLWithPath: "download")) ?? "application/octet-stream"
+        let fallbackFileName = sanitizeDownloadFilename(
+            contentDisposition?.components(separatedBy: "filename=").last?
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\"' "))
+                ?? "download"
+        )
+
+        let params: [String: Any] = [
+            "blobUrl": blobUrl,
+            "fallbackMimeType": fallbackMimeType,
+            "fallbackFileName": fallbackFileName,
+            "legacyMaxBytes": BlobDownloadSupport.maxLegacyBytes,
+            "chunkSize": BlobDownloadSupport.chunkBytes
+        ]
+
+        guard JSONSerialization.isValidJSONObject(params),
+              let paramsData = try? JSONSerialization.data(withJSONObject: params),
+              let paramsJson = String(data: paramsData, encoding: .utf8) else {
+            emitDownloadFailed(sourceURL: blobUrl, error: "Failed to prepare blob download script")
+            return
+        }
+
+        let script = """
+        (function(params) {
+          const blobUrl = params.blobUrl;
+          const fallbackMimeType = params.fallbackMimeType;
+          const fallbackFileName = params.fallbackFileName;
+          const legacyMaxBytes = params.legacyMaxBytes;
+          const chunkSize = params.chunkSize;
+          const matchingLink = Array.from(document.querySelectorAll('a[download]')).find(function(link) { return link.href === blobUrl; });
+          const bridge = (window.mobileApp && window.mobileApp.startBlobDownload && window.mobileApp.appendBlobDownloadChunk && window.mobileApp.finishBlobDownload)
+            ? window.mobileApp
+            : (window.mobileApp && window.mobileApp.handleBlobDownload)
+              ? window.mobileApp
+              : null;
+          const sessionId = 'blob-download-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+          let fileName = fallbackFileName;
+          const readChunkAsBase64 = function(chunk) {
+            return new Promise(function(resolve, reject) {
+              const reader = new FileReader();
+              reader.onloadend = function() {
+                const dataUrl = reader.result || '';
+                resolve(String(dataUrl).split(',').pop() || '');
+              };
+              reader.onerror = function() {
+                reject(reader.error || new Error('Failed to read blob chunk'));
+              };
+              reader.readAsDataURL(chunk);
+            });
+          };
+
+          return (async function() {
+            if (!bridge) {
+              throw new Error('Blob download bridge is not available');
+            }
+
+            const response = await fetch(blobUrl);
+            const blob = await response.blob();
+            fileName = (matchingLink && matchingLink.getAttribute('download')) || fallbackFileName;
+
+            if (bridge.startBlobDownload && bridge.appendBlobDownloadChunk && bridge.finishBlobDownload) {
+              bridge.startBlobDownload(JSON.stringify({
+                sessionId: sessionId,
+                fileName: fileName,
+                sourceUrl: blobUrl,
+                mimeType: blob.type || fallbackMimeType,
+                size: blob.size
+              }));
+              for (let offset = 0; offset < blob.size; offset += chunkSize) {
+                const base64 = await readChunkAsBase64(blob.slice(offset, offset + chunkSize));
+                bridge.appendBlobDownloadChunk(JSON.stringify({ sessionId: sessionId, base64: base64 }));
+              }
+              bridge.finishBlobDownload(JSON.stringify({ sessionId: sessionId }));
+              return;
+            }
+
+            if (blob.size > legacyMaxBytes) {
+              throw new Error('Blob download is too large for the legacy bridge');
+            }
+
+            const base64 = await readChunkAsBase64(blob);
+            bridge.handleBlobDownload(JSON.stringify({
+              fileName: fileName,
+              sourceUrl: blobUrl,
+              mimeType: blob.type || fallbackMimeType,
+              size: blob.size,
+              base64: base64
+            }));
+          })().catch(function(error) {
+            if (bridge && bridge.abortBlobDownload) {
+              bridge.abortBlobDownload(JSON.stringify({
+                sessionId: sessionId,
+                fileName: fileName,
+                sourceUrl: blobUrl,
+                mimeType: fallbackMimeType,
+                reason: String((error && error.message) || error || 'Blob download failed')
+              }));
+            }
+            console.error('Failed to capture blob download', error);
+          });
+        })(\(paramsJson));
+        """
+
+        DispatchQueue.main.async {
+            webView.evaluateJavaScript(script) { _, error in
+                if let error {
+                    self.emitDownloadFailed(sourceURL: blobUrl, error: "Failed to capture blob download: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
     internal var customUserAgent: String? {
         didSet {
             guard let agent = userAgent else {
@@ -674,47 +1146,111 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
     open var statusBarStyle: UIStatusBarStyle = .default
 
     // Status bar background view
-    private var statusBarBackgroundView: UIView?
+    var statusBarBackgroundView: UIView?
 
     // Status bar height
     private var statusBarHeight: CGFloat {
-        return UIApplication.shared.windows.first?.windowScene?.statusBarManager?.statusBarFrame.height ?? 0
+        let windowScene = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }
+            ?? UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first
+        return windowScene?.statusBarManager?.statusBarFrame.height ?? 0
+    }
+
+    private func applyNavigationBarBackground(color: UIColor) {
+        guard let navigationBar = navigationController?.navigationBar else {
+            return
+        }
+
+        navigationBar.backgroundColor = color
+        navigationBar.barTintColor = color
+        navigationBar.isTranslucent = false
+        navigationBar.setBackgroundImage(UIImage(), for: .default)
+        navigationBar.shadowImage = UIImage()
+        navigationBar.setValue(true, forKey: "hidesShadow")
+
+        if #available(iOS 13.0, *) {
+            let appearance = UINavigationBarAppearance()
+            appearance.configureWithOpaqueBackground()
+            appearance.backgroundColor = color
+            appearance.backgroundEffect = nil
+            appearance.shadowColor = .clear
+            appearance.shadowImage = UIImage()
+
+            if let titleTextAttributes = navigationBar.titleTextAttributes {
+                appearance.titleTextAttributes = titleTextAttributes
+            }
+            if let largeTitleTextAttributes = navigationBar.largeTitleTextAttributes {
+                appearance.largeTitleTextAttributes = largeTitleTextAttributes
+            }
+
+            navigationBar.standardAppearance = appearance
+            navigationBar.compactAppearance = appearance
+            navigationBar.scrollEdgeAppearance = appearance
+            navigationBar.compactScrollEdgeAppearance = appearance
+        }
     }
 
     // Make status bar background with colored view underneath
     open func setupStatusBarBackground(color: UIColor) {
-        // Remove any existing status bar view
         statusBarBackgroundView?.removeFromSuperview()
+        statusBarBackgroundView = nil
 
-        // Create a new view to cover both status bar and navigation bar
-        statusBarBackgroundView = UIView()
-
-        if let navView = navigationController?.view {
-            // Add to back of view hierarchy
-            navView.insertSubview(statusBarBackgroundView!, at: 0)
-            statusBarBackgroundView?.translatesAutoresizingMaskIntoConstraints = false
-
-            // Calculate total height - status bar + navigation bar
-            let navBarHeight = navigationController?.navigationBar.frame.height ?? 44
-            let totalHeight = (navigationController?.view.safeAreaInsets.top ?? CGFloat(0)) + navBarHeight
-
-            // Position from top of screen to bottom of navigation bar
-            NSLayoutConstraint.activate([
-                statusBarBackgroundView!.topAnchor.constraint(equalTo: navView.topAnchor),
-                statusBarBackgroundView!.leadingAnchor.constraint(equalTo: navView.leadingAnchor),
-                statusBarBackgroundView!.trailingAnchor.constraint(equalTo: navView.trailingAnchor),
-                statusBarBackgroundView!.heightAnchor.constraint(equalToConstant: totalHeight)
-            ])
-
-            // Set background color
-            statusBarBackgroundView?.backgroundColor = color
-
-            // Make navigation bar transparent to show our view underneath
-            navigationController?.navigationBar.setBackgroundImage(UIImage(), for: .default)
-            navigationController?.navigationBar.shadowImage = UIImage()
-            navigationController?.navigationBar.isTranslucent = true
-            navigationController?.navigationBar.isTranslucent = true
+        guard let navController = navigationController else {
+            return
         }
+
+        if let passThrough = navController.view as? PassThroughView {
+            // Never paint the full-screen overlay — that fills the custom y-offset gap.
+            passThrough.backgroundColor = .clear
+        }
+
+        let navigationBar = navController.navigationBar
+        let hostCandidate = StatusBarBackgroundLayoutSupport.hostView(
+            navigationControllerView: navController.view,
+            framedContentView: (navController.view as? PassThroughView)?.framedContentView
+        )
+        let navigationBarInHost = hostCandidate.map { navigationBar.isDescendant(of: $0) } ?? false
+        let placement = StatusBarBackgroundLayoutSupport.placement(
+            isPassThroughOverlay: navController.view is PassThroughView,
+            blankNavigationTab: blankNavigationTab,
+            navigationBarInHostHierarchy: navigationBarInHost,
+            isFramedCustomOverlay: shouldPresentAsFramedOverlay
+        )
+
+        guard case .host(let pinToNavigationBar) = placement,
+              let hostView = hostCandidate else {
+            return
+        }
+
+        let backgroundView = UIView()
+        statusBarBackgroundView = backgroundView
+        hostView.insertSubview(backgroundView, at: 0)
+        backgroundView.translatesAutoresizingMaskIntoConstraints = false
+        backgroundView.backgroundColor = color
+
+        var constraints = [
+            backgroundView.topAnchor.constraint(equalTo: hostView.topAnchor),
+            backgroundView.leadingAnchor.constraint(equalTo: hostView.leadingAnchor),
+            backgroundView.trailingAnchor.constraint(equalTo: hostView.trailingAnchor)
+        ]
+
+        if pinToNavigationBar {
+            constraints.append(
+                backgroundView.bottomAnchor.constraint(equalTo: navigationBar.bottomAnchor, constant: 1)
+            )
+            applyNavigationBarBackground(color: color)
+        } else {
+            // Blank toolbar / detached nav bar: cover status-bar height only.
+            // Avoid pinning to a hidden UINavigationBar (removed from hierarchy → crash).
+            constraints.append(
+                backgroundView.heightAnchor.constraint(equalToConstant: max(statusBarHeight, 20))
+            )
+        }
+
+        NSLayoutConstraint.activate(constraints)
     }
 
     // Override to use our custom status bar style
@@ -842,6 +1378,7 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
     }
 
     deinit {
+        NotificationCenter.default.removeObserver(self)
         webView?.removeObserver(self, forKeyPath: estimatedProgressKeyPath)
         if websiteTitleInNavigationBar {
             webView?.removeObserver(self, forKeyPath: titleKeyPath)
@@ -882,8 +1419,63 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
 
                 // Force update UI if needed
                 self?.navigationController?.navigationBar.setNeedsLayout()
+
             }
         }
+    }
+
+    func updateTitleAppearance() {
+        guard titleIcon != nil || titleFontFamily != nil else {
+            navigationItem.titleView = nil
+            return
+        }
+
+        let currentTitle = navigationItem.title ?? title ?? webView?.url?.host ?? ""
+        let titleColor = navigationController?.navigationBar.titleTextAttributes?[.foregroundColor] as? UIColor
+            ?? tintColor
+            ?? navigationController?.navigationBar.tintColor
+            ?? .label
+        let fontSize = UIFont.preferredFont(forTextStyle: .headline).pointSize
+        let titleFont = titleFontFamily.flatMap { UIFont(name: $0, size: fontSize) }
+            ?? UIFont.systemFont(ofSize: fontSize, weight: .semibold)
+
+        let label = UILabel()
+        label.text = currentTitle
+        label.textColor = titleColor
+        label.font = titleFont
+        label.lineBreakMode = .byTruncatingTail
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let stackView = UIStackView()
+        stackView.axis = .horizontal
+        stackView.alignment = .center
+        stackView.spacing = 6
+
+        if let titleIcon {
+            let imageView = UIImageView(image: titleIcon.withRenderingMode(.alwaysTemplate))
+            imageView.tintColor = titleColor
+            imageView.contentMode = .scaleAspectFit
+            imageView.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                imageView.widthAnchor.constraint(equalToConstant: 18),
+                imageView.heightAnchor.constraint(equalToConstant: 18)
+            ])
+            stackView.addArrangedSubview(imageView)
+        }
+
+        stackView.addArrangedSubview(label)
+        navigationItem.titleView = stackView
+    }
+
+    override open func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        syncWebViewSafeAreaLayout()
+        refreshWebViewViewportIfNeeded()
+    }
+
+    override open func viewSafeAreaInsetsDidChange() {
+        super.viewSafeAreaInsetsDidChange()
+        syncWebViewSafeAreaLayout()
     }
 
     func updateButtonTintColors() {
@@ -925,6 +1517,7 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
                 navigationItem.rightBarButtonItems?.append(buttonItem)
             }
         }
+        updateTitleAppearance()
     }
 
     override open func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
@@ -986,6 +1579,129 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
         capBrowserPlugin?.notifyListeners(eventName, data: payload(with: data))
     }
 
+    private func startObservingKeyboardViewportChanges() {
+        guard !isObservingKeyboardViewportChanges else {
+            return
+        }
+
+        isObservingKeyboardViewportChanges = true
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(keyboardViewportDidChange(_:)), name: UIResponder.keyboardWillHideNotification, object: nil)
+        center.addObserver(self, selector: #selector(keyboardViewportDidChange(_:)), name: UIResponder.keyboardDidHideNotification, object: nil)
+        center.addObserver(self, selector: #selector(keyboardViewportDidChange(_:)), name: UIResponder.keyboardDidChangeFrameNotification, object: nil)
+    }
+
+    @objc private func keyboardViewportDidChange(_ notification: Notification) {
+        scheduleWebViewViewportRefresh(force: true, delay: viewportRefreshDelay(from: notification))
+    }
+
+    private func viewportRefreshDelay(from notification: Notification) -> TimeInterval {
+        guard let duration = notification.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber else {
+            return 0.05
+        }
+
+        return max(0.05, duration.doubleValue)
+    }
+
+    private func scheduleWebViewViewportRefresh(force: Bool = false, delay: TimeInterval = 0.05) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.refreshWebViewViewportIfNeeded(force: force)
+        }
+    }
+
+    private func refreshWebViewViewportIfNeeded(force: Bool = false) {
+        guard let webView = self.webView, webView.superview != nil else {
+            return
+        }
+
+        if force {
+            self.view.setNeedsLayout()
+            self.view.layoutIfNeeded()
+        }
+
+        let currentSize = webView.bounds.size
+        guard WebViewViewportLayoutSupport.shouldRefreshViewport(
+            previousSize: lastViewportRefreshSize,
+            currentSize: currentSize,
+            force: force
+        ) else {
+            return
+        }
+
+        lastViewportRefreshSize = currentSize
+        webView.setNeedsLayout()
+        webView.layoutIfNeeded()
+        webView.scrollView.setNeedsLayout()
+        webView.scrollView.layoutIfNeeded()
+        webView.evaluateJavaScript("window.dispatchEvent(new Event('resize'));", completionHandler: nil)
+    }
+
+    private func configureWebViewScrollViewSafeArea(_ webView: WKWebView) {
+        if #available(iOS 11.0, *) {
+            webView.scrollView.contentInsetAdjustmentBehavior = WebViewSafeAreaLayoutSupport
+                .contentInsetAdjustmentBehavior(enabledSafeBottomMargin: enabledSafeBottomMargin)
+        }
+
+        webView.insetsLayoutMarginsFromSafeArea = WebViewSafeAreaLayoutSupport
+            .shouldInsetLayoutMarginsFromSafeArea(enabledSafeBottomMargin: enabledSafeBottomMargin)
+
+        if !enabledSafeBottomMargin {
+            webView.scrollView.contentInset = .zero
+            webView.scrollView.scrollIndicatorInsets = .zero
+        }
+    }
+
+    private func syncWebViewSafeAreaLayout() {
+        guard let webView = self.webView, webView.superview != nil else {
+            return
+        }
+
+        let rawSafeAreaBottomInset = WebViewSafeAreaLayoutSupport.rawSystemBottomInset(
+            effectiveBottomInset: view.safeAreaInsets.bottom,
+            additionalBottomInset: additionalSafeAreaInsets.bottom
+        )
+
+        let bottomOffset = WebViewSafeAreaLayoutSupport.additionalBottomSafeAreaOffset(
+            enabledSafeBottomMargin: enabledSafeBottomMargin,
+            safeAreaBottomInset: rawSafeAreaBottomInset
+        )
+        if additionalSafeAreaInsets.bottom != bottomOffset {
+            additionalSafeAreaInsets.bottom = bottomOffset
+        }
+
+        configureWebViewScrollViewSafeArea(webView)
+
+        let topInset = WebViewSafeAreaLayoutSupport.cssTopInset(
+            enabledSafeTopMargin: enabledSafeTopMargin,
+            safeAreaTopInset: view.safeAreaInsets.top
+        )
+        let bottomInset = WebViewSafeAreaLayoutSupport.cssBottomInset(
+            enabledSafeBottomMargin: enabledSafeBottomMargin,
+            safeAreaBottomInset: rawSafeAreaBottomInset
+        )
+        let leftInset = view.safeAreaInsets.left
+        let rightInset = view.safeAreaInsets.right
+
+        let roundedInsets = InjectedSafeAreaInsets(
+            top: Int(topInset.rounded()),
+            bottom: Int(bottomInset.rounded()),
+            left: Int(leftInset.rounded()),
+            right: Int(rightInset.rounded())
+        )
+        if lastInjectedSafeAreaInsets == roundedInsets {
+            return
+        }
+        lastInjectedSafeAreaInsets = roundedInsets
+
+        let script = WebViewSafeAreaLayoutSupport.safeAreaCssVariablesScript(
+            top: topInset,
+            bottom: bottomInset,
+            left: leftInset,
+            right: rightInset
+        )
+        webView.evaluateJavaScript(script, completionHandler: nil)
+    }
+
     private func jsonString(from object: Any) -> String? {
         guard JSONSerialization.isValidJSONObject(object),
               let data = try? JSONSerialization.data(withJSONObject: object),
@@ -1015,7 +1731,7 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
         }
     }
 
-    func takeScreenshot(completion: @escaping (Result<[String: Any], Error>) -> Void) {
+    func takeScreenshot(emitEvent: Bool = true, completion: @escaping (Result<[String: Any], Error>) -> Void) {
         DispatchQueue.main.async {
             guard let webView = self.webView else {
                 completion(.failure(NSError(domain: "InAppBrowser", code: 1, userInfo: [NSLocalizedDescriptionKey: "WebView is not initialized"])))
@@ -1053,7 +1769,9 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
                     "width": Int(image.size.width * image.scale),
                     "height": Int(image.size.height * image.scale)
                 ]
-                self.emit("screenshotTaken", data: result)
+                if emitEvent {
+                    self.emit("screenshotTaken", data: result)
+                }
                 completion(.success(result))
             }
         }
@@ -1069,6 +1787,16 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
                 print("Received non-dictionary message from JavaScript:", message.body)
                 emit("messageFromWebview", data: ["rawMessage": String(describing: message.body)])
             }
+        } else if message.name == "blobDownload" {
+            handleLegacyBlobDownloadPayload(message.body)
+        } else if message.name == "blobDownloadStart" {
+            startBlobDownloadPayload(message.body)
+        } else if message.name == "blobDownloadChunk" {
+            appendBlobDownloadChunkPayload(message.body)
+        } else if message.name == "blobDownloadFinish" {
+            finishBlobDownloadPayload(message.body)
+        } else if message.name == "blobDownloadAbort" {
+            abortBlobDownloadPayload(message.body)
         } else if message.name == "consoleMessageHandler" {
             if let messageBody = message.body as? [String: Any] {
                 emit("consoleMessage", data: ConsoleMessageSupport.normalizePayload(from: messageBody))
@@ -1097,6 +1825,25 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
             }
             print("[InAppBrowser - preShowScriptError]: Error!!!!")
             semaphore.signal()
+        } else if message.name == "capgoProxyBridge" {
+            guard let messageBody = message.body as? [String: Any],
+                  let token = messageBody["token"] as? String,
+                  let requestId = messageBody["requestId"] as? String,
+                  let method = messageBody["method"] as? String,
+                  let headersJson = messageBody["headersJson"] as? String else {
+                return
+            }
+
+            let base64Body = messageBody["base64Body"] as? String ?? ""
+            let credentialsMode = messageBody["credentialsMode"] as? String ?? "same-origin"
+            proxyBridge?.storeRequest(
+                token: token,
+                requestId: requestId,
+                method: method,
+                headersJson: headersJson,
+                base64Body: base64Body,
+                credentialsMode: credentialsMode
+            )
         } else if message.name == "close" {
             closeView()
         } else if message.name == "hide" {
@@ -1195,6 +1942,21 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
                         },
                         close: function() {
                                 window.webkit.messageHandlers.close.postMessage(null);
+                        },
+                        handleBlobDownload: function(payload) {
+                                window.webkit.messageHandlers.blobDownload.postMessage(payload);
+                        },
+                        startBlobDownload: function(payload) {
+                                window.webkit.messageHandlers.blobDownloadStart.postMessage(payload);
+                        },
+                        appendBlobDownloadChunk: function(payload) {
+                                window.webkit.messageHandlers.blobDownloadChunk.postMessage(payload);
+                        },
+                        finishBlobDownload: function(payload) {
+                                window.webkit.messageHandlers.blobDownloadFinish.postMessage(payload);
+                        },
+                        abortBlobDownload: function(payload) {
+                                window.webkit.messageHandlers.blobDownloadAbort.postMessage(payload);
                         }\(extraControls)\(screenshotControls)
                 });
                 if (!window.__capgoInAppBrowserWindowCloseInstalled) {
@@ -1231,6 +1993,35 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
         userContentController.addUserScript(script)
     }
 
+    private func addProxyBridgeUserScripts(to userContentController: WKUserContentController) {
+        guard let accessToken = proxyBridgeAccessToken else {
+            return
+        }
+
+        let bootstrapScript = WKUserScript(
+            source: ProxyBridgeSupport.bootstrapScriptSource(),
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        )
+        userContentController.addUserScript(bootstrapScript)
+
+        let proxyRegexSource = legacyProxyRequestURLRegexPattern ?? ""
+        guard let bridgeScriptSource = ProxyBridgeSupport.loadBundledBridgeScript(
+            accessToken: accessToken,
+            proxyRegexSource: proxyRegexSource
+        ) else {
+            print("[InAppBrowser][Proxy] WARNING: Failed to load proxy-bridge.js for iOS injection")
+            return
+        }
+
+        let bridgeScript = WKUserScript(
+            source: bridgeScriptSource,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        )
+        userContentController.addUserScript(bridgeScript)
+    }
+
     func injectJavaScriptInterface() {
         let script = mobileAppScriptSource()
         DispatchQueue.main.async {
@@ -1246,28 +2037,26 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
         }
     }
 
-    open func initWebview(isInspectable: Bool = true) {
+    open func initWebview(isInspectable: Bool = false) {
         if self.isWebViewInitialized {
             return
         }
         self.isWebViewInitialized = true
+        self.isInspectable = isInspectable
+        self.startObservingKeyboardViewportChanges()
         self.view.backgroundColor = UIColor.white
 
         self.extendedLayoutIncludesOpaqueBars = true
         self.edgesForExtendedLayout = [.bottom]
 
         let webConfiguration = initialWebConfiguration ?? WKWebViewConfiguration()
+        webConfiguration.websiteDataStore = BrowsingDataStoreSupport.websiteDataStore(
+            persistWebViewData: persistWebViewData,
+            useSharedDataStore: useSharedDataStore
+        )
         let userContentController = webConfiguration.userContentController
         userContentController.removeAllUserScripts()
-        userContentController.removeScriptMessageHandler(forName: "messageHandler")
-        userContentController.removeScriptMessageHandler(forName: "preShowScriptError")
-        userContentController.removeScriptMessageHandler(forName: "preShowScriptSuccess")
-        userContentController.removeScriptMessageHandler(forName: "close")
-        userContentController.removeScriptMessageHandler(forName: "hide")
-        userContentController.removeScriptMessageHandler(forName: "show")
-        userContentController.removeScriptMessageHandler(forName: "takeScreenshot")
-        userContentController.removeScriptMessageHandler(forName: "consoleMessageHandler")
-        userContentController.removeScriptMessageHandler(forName: "magicPrint")
+        ScriptMessageHandlerSupport.removeAll(from: userContentController)
 
         if proxyRequests || proxySchemeHandler != nil, let handler = proxySchemeHandler {
             WKWebView.enableCustomSchemeHandling(for: ["https", "http"])
@@ -1279,6 +2068,16 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
             }
         }
 
+        let bundledAssetHandler = BundledAssetSchemeHandler(expectedHost: bundledAssetLocalHost)
+        self.bundledAssetSchemeHandler = bundledAssetHandler
+        if webConfiguration.urlSchemeHandler(forURLScheme: bundledAssetLocalScheme) == nil {
+            webConfiguration.setURLSchemeHandler(bundledAssetHandler, forURLScheme: bundledAssetLocalScheme)
+        }
+
+        if ProxyBridgeSupport.shouldInjectBridge(hasProxySchemeHandler: proxySchemeHandler != nil) {
+            addProxyBridgeUserScripts(to: userContentController)
+        }
+
         let weakHandler = WeakScriptMessageHandler(self)
         userContentController.add(weakHandler, name: "messageHandler")
         userContentController.add(weakHandler, name: "preShowScriptError")
@@ -1286,6 +2085,11 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
         userContentController.add(weakHandler, name: "close")
         userContentController.add(weakHandler, name: "hide")
         userContentController.add(weakHandler, name: "show")
+        userContentController.add(weakHandler, name: "blobDownload")
+        userContentController.add(weakHandler, name: "blobDownloadStart")
+        userContentController.add(weakHandler, name: "blobDownloadChunk")
+        userContentController.add(weakHandler, name: "blobDownloadFinish")
+        userContentController.add(weakHandler, name: "blobDownloadAbort")
         if allowScreenshotsFromWebPage {
             userContentController.add(weakHandler, name: "takeScreenshot")
         }
@@ -1314,6 +2118,9 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
                 )
             )
         }
+        if ProxyBridgeSupport.shouldInjectBridge(hasProxySchemeHandler: proxySchemeHandler != nil) {
+            userContentController.add(weakHandler, name: "capgoProxyBridge")
+        }
         userContentController.add(weakHandler, name: "magicPrint")
 
         // Inject JavaScript to override window.print
@@ -1332,9 +2139,7 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
         webConfiguration.allowsInlineMediaPlayback = true
         webConfiguration.userContentController = userContentController
         // Enable background task processing
-        if initialWebConfiguration == nil {
-            webConfiguration.processPool = WKProcessPool()
-        }
+        // WKProcessPool is shared automatically on iOS 15+; explicit assignment is deprecated.
 
         // Enable JavaScript to run automatically (needed for preShowScript and Firebase polyfill)
         webConfiguration.preferences.javaScriptCanOpenWindowsAutomatically = true
@@ -1391,9 +2196,7 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
         //        }
 
         if #available(iOS 16.4, *) {
-            webView.isInspectable = true
-        } else {
-            // Fallback on earlier versions
+            webView.isInspectable = isInspectable
         }
 
         // First add the webView to view hierarchy
@@ -1427,6 +2230,8 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
 
         // Disable bounce effect by setting scrollView.bounces to false when disableOverscroll is true
         webView.scrollView.bounces = !self.disableOverscroll
+        configureReloadGesture(for: webView)
+        configureWebViewScrollViewSafeArea(webView)
 
         webView.addObserver(self, forKeyPath: estimatedProgressKeyPath, options: .new, context: nil)
         if websiteTitleInNavigationBar {
@@ -1493,17 +2298,31 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
         self.ignoreUntrustedSSLError = parent.ignoreUntrustedSSLError
         self.enableGooglePaySupport = parent.enableGooglePaySupport
         self.preventDeeplink = parent.preventDeeplink
+        self.closeAction = parent.closeAction
+        self.screenshotOnHide = parent.screenshotOnHide
+        self.titleFontFamily = parent.titleFontFamily
+        self.titleIcon = parent.titleIcon
         self.openBlankTargetInWebView = parent.openBlankTargetInWebView
         self.blankNavigationTab = false
         self.enabledSafeBottomMargin = parent.enabledSafeBottomMargin
         self.enabledSafeTopMargin = parent.enabledSafeTopMargin
         self.blockedHosts = parent.blockedHosts
         self.authorizedAppLinks = parent.authorizedAppLinks
-        self.activeNativeNavigationForWebview = parent.activeNativeNavigationForWebview
+        // createWebViewWith configs copy parent script handlers; start clean so
+        // initWebview can register blobDownload/etc without NSInvalidArgumentException.
+        configuration.userContentController = WKUserContentController()
+        self.initialWebConfiguration = configuration
+        self.persistWebViewData = parent.persistWebViewData
+        self.useSharedDataStore = parent.useSharedDataStore
+        self.enableReloadGesture = parent.enableReloadGesture
         self.disableOverscroll = parent.disableOverscroll
         self.proxyRequests = parent.proxyRequests
         self.proxySchemeHandler = proxySchemeHandler
-        self.initialWebConfiguration = configuration
+        self.bundledAssetLocalScheme = parent.bundledAssetLocalScheme
+        self.bundledAssetLocalHost = parent.bundledAssetLocalHost
+        self.proxyBridge = parent.proxyBridge
+        self.proxyBridgeAccessToken = parent.proxyBridgeAccessToken
+        self.legacyProxyRequestURLRegexPattern = parent.legacyProxyRequestURLRegexPattern
         self.waitsForPopupNavigation = true
         self.hiddenPopupWindow = parent.hiddenPopupWindow
         self.opensHidden = parent.hiddenPopupWindow
@@ -1536,52 +2355,14 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
         self.view.backgroundColor = parent.view.backgroundColor
         self.title = parent.title ?? request.url?.host ?? "Popup Window"
         self.navigationItem.title = self.title
-        self.initWebview()
+        self.initWebview(isInspectable: parent.isInspectable)
         return self.capableWebView
     }
 
-    @objc func restateViewHeight() {
-        var bottomPadding = CGFloat(0.0)
-        var topPadding = CGFloat(0.0)
-        let window = UIApplication.shared.windows.first(where: { $0.isKeyWindow })
-        bottomPadding = window?.safeAreaInsets.bottom ?? 0.0
-        topPadding = window?.safeAreaInsets.top ?? 0.0
-        if UIDevice.current.orientation.isPortrait {
-            // Don't force toolbar visibility
-            if self.viewHeightPortrait == nil {
-                self.viewHeightPortrait = self.view.safeAreaLayoutGuide.layoutFrame.size.height
-                self.viewHeightPortrait! += bottomPadding
-                if self.navigationController?.navigationBar.isHidden == true {
-                    self.viewHeightPortrait! += topPadding
-                }
-            }
-            self.currentViewHeight = self.viewHeightPortrait
-        } else if UIDevice.current.orientation.isLandscape {
-            // Don't force toolbar visibility
-            if self.viewHeightLandscape == nil {
-                self.viewHeightLandscape = self.view.safeAreaLayoutGuide.layoutFrame.size.height
-                self.viewHeightLandscape! += bottomPadding
-                if self.navigationController?.navigationBar.isHidden == true {
-                    self.viewHeightLandscape! += topPadding
-                }
-            }
-            self.currentViewHeight = self.viewHeightLandscape
-        }
-    }
-
-    override open func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
-        //        self.view.frame.size.height = self.currentViewHeight!
-    }
-
-    override open func viewWillLayoutSubviews() {
-        // [RAYANUKI] make the entire page fullscreen if enabledSafeBottomMargin = false
-        if self.enabledSafeBottomMargin {
-             restateViewHeight()
-        }
-        // Don't override frame height when enabledSafeBottomMargin is true, as it would override our constraints
-        if self.currentViewHeight != nil && !self.enabledSafeBottomMargin {
-            self.view.frame.size.height = self.currentViewHeight!
-        }
+    private func applyNavigationVisibility() {
+        navigationController?.setNavigationBarHidden(blankNavigationTab, animated: false)
+        // Always hide toolbar since we never want it.
+        navigationController?.setToolbarHidden(true, animated: false)
     }
 
     override open func viewWillAppear(_ animated: Bool) {
@@ -1595,12 +2376,15 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
             applyCustomDimensions()
         }
 
+        // Reapply presentation state after hide/show re-presents the same controller.
+        applyNavigationVisibility()
+
         // Force update button appearances
         updateButtonTintColors()
 
         // Ensure status bar appearance is correct when view appears
         // Make sure we have the latest tint color
-        if let tintColor = self.tintColor {
+        if self.tintColor != nil {
             // Update the status bar background if needed
             if let navController = navigationController, let backgroundColor = navController.navigationBar.backgroundColor ?? statusBarBackgroundView?.backgroundColor {
                 setupStatusBarBackground(color: backgroundColor)
@@ -1623,6 +2407,8 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
 
     override open func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        refreshWebViewViewportIfNeeded(force: true)
+        scheduleWebViewViewportRefresh(force: true, delay: 0.25)
 
         // Force add buttonNearDone if it's not visible yet
         if buttonNearDoneIcon != nil {
@@ -1673,6 +2459,7 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
                 }
                 self.progressView?.alpha = 1
                 self.progressView?.setProgress(Float(estimatedProgress), animated: true)
+                self.emit("browserPageLoadProgress", data: ["progress": estimatedProgress])
 
                 if estimatedProgress >= 1.0 {
                     UIView.animate(withDuration: 0.3, delay: 0.3, options: .curveEaseOut, animations: {
@@ -1686,6 +2473,7 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
         case titleKeyPath?:
             if self.hasDynamicTitle {
                 self.navigationItem.title = webView?.url?.host
+                self.updateTitleAppearance()
             }
         case "URL":
             // Guard against notifications during cleanup when webView is being torn down
@@ -1703,6 +2491,14 @@ open class WKWebViewController: UIViewController, WKScriptMessageHandler {
 
 // MARK: - Public Methods
 public extension WKWebViewController {
+
+    func goBack() -> Bool {
+        if webView?.canGoBack ?? false {
+            webView?.goBack()
+            return true
+        }
+        return false
+    }
 
     func load(source sourceValue: WKWebSource) {
         switch sourceValue {
@@ -1785,10 +2581,19 @@ public extension WKWebViewController {
         self.webView?.allowsBackForwardNavigationGestures = self.activeNativeNavigationForWebview
     }
 
-    open func cleanupWebView() {
+    func cleanupWebView() {
         guard let webView = self.webView else { return }
         webView.stopLoading()
         previewItemURL = nil
+
+        if reloadPanObserverInstalled {
+            webView.scrollView.panGestureRecognizer.removeTarget(self, action: #selector(handleReloadPanGesture(_:)))
+            reloadPanObserverInstalled = false
+        }
+        pendingReloadFromGesture = false
+        reloadFromGestureInProgress = false
+        reloadGestureNavigation = nil
+        reloadGestureArmedPullDistance = 0
 
         // Remove KVO observers FIRST, before any operation that could trigger them
         webView.removeObserver(self, forKeyPath: estimatedProgressKeyPath)
@@ -1803,19 +2608,7 @@ public extension WKWebViewController {
         webView.loadHTMLString("", baseURL: nil)
 
         webView.configuration.userContentController.removeAllUserScripts()
-        webView.configuration.userContentController.removeScriptMessageHandler(forName: "messageHandler")
-        webView.configuration.userContentController.removeScriptMessageHandler(forName: "close")
-        webView.configuration.userContentController.removeScriptMessageHandler(forName: "hide")
-        webView.configuration.userContentController.removeScriptMessageHandler(forName: "show")
-        if allowScreenshotsFromWebPage {
-            webView.configuration.userContentController.removeScriptMessageHandler(forName: "takeScreenshot")
-        }
-        if captureConsoleLogs {
-            webView.configuration.userContentController.removeScriptMessageHandler(forName: "consoleMessageHandler")
-        }
-        webView.configuration.userContentController.removeScriptMessageHandler(forName: "preShowScriptSuccess")
-        webView.configuration.userContentController.removeScriptMessageHandler(forName: "preShowScriptError")
-        webView.configuration.userContentController.removeScriptMessageHandler(forName: "magicPrint")
+        ScriptMessageHandlerSupport.removeAll(from: webView.configuration.userContentController)
 
         webView.removeFromSuperview()
         // Also clean progress bar view if present
@@ -2031,11 +2824,7 @@ fileprivate extension WKWebViewController {
     }
 
     func setUpState() {
-        navigationController?.setNavigationBarHidden(false, animated: true)
-
-        // Always hide toolbar since we never want it
-        navigationController?.setToolbarHidden(true, animated: true)
-
+        applyNavigationVisibility()
         // Set tint colors but don't override specific colors
         if tintColor == nil {
             // Use system appearance if no specific tint color is set
@@ -2055,7 +2844,10 @@ fileprivate extension WKWebViewController {
 
         navigationController?.navigationBar.tintColor = previousNavigationBarState.tintColor
 
-        navigationController?.setNavigationBarHidden(previousNavigationBarState.hidden, animated: true)
+        navigationController?.setNavigationBarHidden(
+            blankNavigationTab || previousNavigationBarState.hidden,
+            animated: true
+        )
     }
 
     func checkRequestCookies(_ request: URLRequest, cookies: [HTTPCookie]) -> Bool {
@@ -2085,8 +2877,9 @@ fileprivate extension WKWebViewController {
     private func tryOpenCustomScheme(_ url: URL) -> Bool {
         let app = UIApplication.shared
         let shouldEmitCustomSchemeEvent = CustomSchemeInterceptSupport.shouldEmitInterceptEvent(for: url)
+        let canOpen = app.canOpenURL(url)
 
-        if app.canOpenURL(url) {
+        if CustomSchemeOpenSupport.shouldAttemptOpen(scheme: url.scheme, canOpenURL: canOpen) {
             app.open(url, options: [:], completionHandler: nil)
             if shouldEmitCustomSchemeEvent {
                 emit("customSchemeIntercepted", data: ["url": url.absoluteString, "opened": true])
@@ -2102,10 +2895,22 @@ fileprivate extension WKWebViewController {
         return true
     }
 
-    private func tryOpenUniversalLink(_ url: URL, completion: @escaping (Bool) -> Void) {
-        // Only for http(s):// and authorized hosts
-        UIApplication.shared.open(url, options: [.universalLinksOnly: true]) { opened in
-            completion(opened) // true => app opened, false => no associated app
+    /// Prefer Universal Links into the native app; if that fails, hand off to the system
+    /// (App Store, Safari, etc.) before falling back to in-webview loading.
+    private func openAuthorizedAppLink(_ url: URL, completion: @escaping (Bool) -> Void) {
+        UIApplication.shared.open(url, options: [.universalLinksOnly: true]) { universalLinkOpened in
+            if universalLinkOpened {
+                completion(true)
+                return
+            }
+
+            UIApplication.shared.open(url, options: [:]) { systemOpenSucceeded in
+                let outcome = AuthorizedAppLinkOpenSupport.resolve(
+                    universalLinkOpened: false,
+                    systemOpenSucceeded: systemOpenSucceeded
+                )
+                completion(outcome == .openedExternally)
+            }
         }
     }
 
@@ -2187,6 +2992,16 @@ fileprivate extension WKWebViewController {
             return
         }
 
+        let bundledLocalConfig = BundledAssetSupport.LocalConfig(
+            scheme: bundledAssetLocalScheme,
+            host: bundledAssetLocalHost
+        )
+        if BundledAssetSupport.isBundledLocalURL(url.absoluteString, localConfig: bundledLocalConfig) {
+            print("[InAppBrowser] bundled local asset URL detected, allowing navigation")
+            completion(false)
+            return
+        }
+
         // Handle all non-http(s) schemes by default
         if scheme != "http" && scheme != "https" && scheme != "file" {
             print("[InAppBrowser] not http(s) scheme, try to open URLs in external apps")
@@ -2209,12 +3024,12 @@ fileprivate extension WKWebViewController {
             return
         }
 
-        // Authorized Universal Link hosts: prefer app via universalLinksOnly
+        // Authorized App Link hosts: Universal Link first, then system open.
         print("[InAppBrowser] Authorized App Links: \(self.authorizedAppLinks)")
         if isUrlAuthorized(url, authorizedLinks: self.authorizedAppLinks) {
-            print("[InAppBrowser] Authorized Universal Link detected \(scheme + host), try to open URLs in external apps")
-            tryOpenUniversalLink(url) { opened in
-                print("[InAppBrowser] Handle as Universal Link: \(opened)")
+            print("[InAppBrowser] Authorized App Link detected \(scheme + host), try to open URLs in external apps")
+            openAuthorizedAppLink(url) { opened in
+                print("[InAppBrowser] Authorized App Link opened externally: \(opened)")
                 completion(opened) // opened => cancel navigation; not opened => allow WebView
             }
             return
@@ -2233,14 +3048,6 @@ fileprivate extension WKWebViewController {
     }
 
     // Public method for safe back navigation
-    public func goBack() -> Bool {
-        if webView?.canGoBack ?? false {
-            webView?.goBack()
-            return true
-        }
-        return false
-    }
-
     @objc func forwardDidClick(sender: AnyObject) {
         webView?.goForward()
     }
@@ -2345,6 +3152,26 @@ fileprivate extension WKWebViewController {
         }
         if canDismiss {
             let currentUrl = webView?.url?.absoluteString ?? ""
+            if closeAction == "hide" {
+                if toolbarHideInProgress {
+                    return
+                }
+                toolbarHideInProgress = true
+                if screenshotOnHide {
+                    takeScreenshot(emitEvent: false) { result in
+                        switch result {
+                        case .success(let screenshot):
+                            self.capBrowserPlugin?.handleWebViewDidHide(id: self.instanceId, url: currentUrl, screenshot: screenshot)
+                        case .failure(let error):
+                            print("[InAppBrowser] Failed to capture screenshot before hiding: \(error.localizedDescription)")
+                            self.capBrowserPlugin?.handleWebViewDidHide(id: self.instanceId, url: currentUrl)
+                        }
+                    }
+                } else {
+                    self.capBrowserPlugin?.handleWebViewDidHide(id: instanceId, url: currentUrl)
+                }
+                return
+            }
             cleanupWebView()
             self.capBrowserPlugin?.handleWebViewDidClose(id: instanceId, url: currentUrl)
             dismiss(animated: true, completion: nil)
@@ -2391,7 +3218,7 @@ fileprivate extension WKWebViewController {
         dismiss(animated: true, completion: nil)
     }
 
-    open func setUpNavigationBarAppearance() {
+    func setUpNavigationBarAppearance() {
         // Set up basic bar appearance
         if let navBar = navigationController?.navigationBar {
             // Make navigation bar transparent
@@ -2448,15 +3275,7 @@ extension WKWebViewController: WKUIDelegate {
                 strongCompletionHandler()
             }))
 
-            // Try to present the alert
-            do {
-                self.present(alertController, animated: true, completion: nil)
-            } catch {
-                // This won't typically be triggered as present doesn't throw,
-                // but adding as a safeguard
-                print("[InAppBrowser] Error presenting alert: \(error)")
-                strongCompletionHandler()
-            }
+            self.present(alertController, animated: true, completion: nil)
         }
     }
 
@@ -2497,6 +3316,31 @@ extension WKWebViewController: WKUIDelegate {
         }
 
         print("[InAppBrowser] Handling popup/new window request for URL: \(url.absoluteString)")
+
+        let isAuthorized = isUrlAuthorized(url, authorizedLinks: authorizedAppLinks)
+        switch BlankTargetNavigationSupport.resolve(
+            urlIsHttpOrHttps: isHttpOrHttps(url),
+            openBlankTargetInWebView: openBlankTargetInWebView,
+            preventDeeplink: preventDeeplink,
+            isAuthorizedAppLink: isAuthorized
+        ) {
+        case .openExternalApp:
+            // Prefer native app / Universal Link, then system open (App Store / Safari).
+            openAuthorizedAppLink(url) { [weak webView] opened in
+                if !opened {
+                    DispatchQueue.main.async {
+                        webView?.load(navigationAction.request)
+                    }
+                }
+            }
+            return nil
+        case .loadInCurrentWebView:
+            webView.load(navigationAction.request)
+            return nil
+        case .createPopup:
+            break
+        }
+
         return capBrowserPlugin?.createManagedPopupWebView(
             from: self,
             configuration: configuration,
@@ -2516,6 +3360,19 @@ extension WKWebViewController: WKUIDelegate {
 
         // Grant geolocation permission automatically for openWebView
         // This allows websites to access location when opened with openWebView
+        decisionHandler(.grant)
+    }
+
+    @available(iOS 15.0, *)
+    public func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin, initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType, decisionHandler: @escaping (WKPermissionDecision) -> Void) {
+        print("[InAppBrowser] Media capture permission requested for origin: \(origin.host)")
+
+        // Grant media capture permission automatically, matching Capacitor core's
+        // WebViewDelegationHandler. The OS-level camera/microphone permission
+        // (Info.plist usage description + system prompt) still applies — this only
+        // suppresses WebKit's extra per-origin prompt, which is not persisted
+        // across app launches (WebKit bug 220416) and would otherwise re-prompt
+        // users on every cold start.
         decisionHandler(.grant)
     }
 }
@@ -2655,6 +3512,7 @@ extension WKWebViewController: WKNavigationDelegate {
             self.url = urlValue
             delegate?.webViewController?(self, didStart: urlValue)
         }
+        emit("browserPageLoadStart")
     }
     public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         if !didpageInit && self.capBrowserPlugin?.isPresentAfterPageLoad == true {
@@ -2702,6 +3560,10 @@ extension WKWebViewController: WKNavigationDelegate {
             delegate?.webViewController?(self, didFinish: url)
         }
         self.injectJavaScriptInterface()
+        // End refresh + clear sticky insets before safe-area sync zeroes contentInset.
+        stopReloadGesture(for: navigation)
+        lastInjectedSafeAreaInsets = nil
+        syncWebViewSafeAreaLayout()
         emit("browserPageLoaded")
     }
 
@@ -2712,6 +3574,7 @@ extension WKWebViewController: WKNavigationDelegate {
             self.url = url
             delegate?.webViewController?(self, didFail: url, withError: error)
         }
+        stopReloadGesture(for: navigation)
         emit("pageLoadError")
     }
 
@@ -2722,6 +3585,7 @@ extension WKWebViewController: WKNavigationDelegate {
             self.url = url
             delegate?.webViewController?(self, didFail: url, withError: error)
         }
+        stopReloadGesture(for: navigation)
         emit("pageLoadError")
     }
 
@@ -2753,7 +3617,10 @@ extension WKWebViewController: WKNavigationDelegate {
     }
 
     public func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-        let shouldForceDownload = handleDownloads && navigationAction.shouldPerformDownload
+        if handleDownloads && navigationAction.shouldPerformDownload {
+            decisionHandler(.download)
+            return
+        }
 
         var actionPolicy: WKNavigationActionPolicy = self.preventDeeplink ? .preventDeeplinkActionPolicy : .allow
 
@@ -2763,7 +3630,20 @@ extension WKWebViewController: WKNavigationDelegate {
             return
         }
 
-        if url.absoluteString.contains("apps.apple.com") {
+        if handleDownloads, url.scheme?.lowercased() == "blob" {
+            handleBlobDownloadFromPage(
+                blobUrl: url.absoluteString,
+                mimeType: navigationAction.request.value(forHTTPHeaderField: "Content-Type"),
+                contentDisposition: navigationAction.request.value(forHTTPHeaderField: "Content-Disposition")
+            )
+            decisionHandler(.cancel)
+            return
+        }
+
+        let appStoreHosts = ["apps.apple.com", "itunes.apple.com"]
+        if !self.preventDeeplink,
+           let appStoreHost = self.normalizeHost(url.host),
+           appStoreHosts.contains(appStoreHost) {
             UIApplication.shared.open(url, options: [:], completionHandler: nil)
             decisionHandler(.cancel)
             return
@@ -2819,11 +3699,6 @@ extension WKWebViewController: WKNavigationDelegate {
                 actionPolicy = result ? .allow : .cancel
             }
 
-            if shouldForceDownload, actionPolicy != .cancel {
-                decisionHandler(.download)
-                return
-            }
-
             self.injectJavaScriptInterface()
             decisionHandler(actionPolicy)
         }
@@ -2840,40 +3715,70 @@ extension WKWebViewController: WKNavigationDelegate {
 
     public func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
         register(download: download, response: nil, sourceURL: navigationAction.request.url?.absoluteString)
+        stopReloadGesture()
     }
 
     public func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
         register(download: download, response: navigationResponse.response)
+        stopReloadGesture()
+    }
+
+    public func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        stopReloadGesture()
     }
 
     // MARK: - Dimension Management
 
-    /// Apply custom dimensions to the view if specified
-    open func applyCustomDimensions() {
-        guard let navigationController = navigationController else { return }
-
-        // Apply custom dimensions if both width and height are specified
-        if let width = customWidth, let height = customHeight {
-            let xPos = customX ?? 0
-            let yPos = customY ?? 0
-
-            // Set the frame for the navigation controller's view
-            navigationController.view.frame = CGRect(x: xPos, y: yPos, width: width, height: height)
+    func applyCustomDimensions() {
+        guard let navigationController = navigationController else {
+            return
         }
-        // If only height is specified, use fullscreen width
-        else if let height = customHeight, customWidth == nil {
-            let xPos = customX ?? 0
-            let yPos = customY ?? 0
-            let screenWidth = UIScreen.main.bounds.width
 
-            // Set the frame with fullscreen width and custom height
-            navigationController.view.frame = CGRect(x: xPos, y: yPos, width: screenWidth, height: height)
+        let hostView = navigationController.view.superview
+        let screenSize = CustomWebViewFrameSupport.screenSize(for: hostView ?? navigationController.view)
+        guard let screenFrame = CustomWebViewFrameSupport.resolvedFrame(
+            width: customWidth,
+            height: customHeight,
+            x: customX,
+            y: customY,
+            fallbackSize: screenSize
+        ) else {
+            return
         }
-        // Otherwise, use default fullscreen behavior (no action needed)
+
+        if let passThroughView = navigationController.view as? PassThroughView {
+            // PassThroughView is full-screen; content stays in screen-space coordinates.
+            passThroughView.targetFrame = screenFrame
+            let contentView = passThroughView.framedContentView ?? passThroughView.subviews.first
+            contentView?.frame = screenFrame
+            contentView?.setNeedsLayout()
+            contentView?.layoutIfNeeded()
+            passThroughView.setNeedsLayout()
+            passThroughView.layoutIfNeeded()
+        } else if let hostView {
+            let frameInHost = CustomWebViewFrameSupport.frameInHost(
+                width: customWidth,
+                height: customHeight,
+                x: customX,
+                y: customY,
+                screenSize: screenSize,
+                hostOriginInScreen: CustomWebViewFrameSupport.hostOriginInScreen(for: hostView)
+            ) ?? screenFrame
+            navigationController.view.frame = frameInHost
+            navigationController.view.clipsToBounds = true
+            navigationController.view.setNeedsLayout()
+            navigationController.view.layoutIfNeeded()
+        } else {
+            navigationController.view.frame = screenFrame
+            navigationController.view.setNeedsLayout()
+            navigationController.view.layoutIfNeeded()
+        }
+
+        refreshWebViewViewportIfNeeded(force: true)
     }
 
     /// Update dimensions at runtime
-    open func updateDimensions(width: CGFloat?, height: CGFloat?, xPos: CGFloat?, yPos: CGFloat?) {
+    func updateDimensions(width: CGFloat?, height: CGFloat?, xPos: CGFloat?, yPos: CGFloat?) {
         // Update stored dimensions
         if let width = width {
             customWidth = width
@@ -2892,7 +3797,7 @@ extension WKWebViewController: WKNavigationDelegate {
         applyCustomDimensions()
     }
 
-    open func updateSafeTopMargin(_ enabled: Bool) {
+    func updateSafeTopMargin(_ enabled: Bool) {
         guard enabled != self.enabledSafeTopMargin else { return }
         self.enabledSafeTopMargin = enabled
         guard let webView = self.webView else { return }
@@ -2910,9 +3815,11 @@ extension WKWebViewController: WKNavigationDelegate {
             webView.topAnchor.constraint(equalTo: topAnchor)
         ])
         self.view.layoutIfNeeded()
+        syncWebViewSafeAreaLayout()
+        refreshWebViewViewportIfNeeded(force: true)
     }
 
-    open func updateSafeBottomMargin(_ enabled: Bool) {
+    func updateSafeBottomMargin(_ enabled: Bool) {
         guard enabled != self.enabledSafeBottomMargin else { return }
         self.enabledSafeBottomMargin = enabled
         guard let webView = self.webView else { return }
@@ -2930,6 +3837,8 @@ extension WKWebViewController: WKNavigationDelegate {
             webView.bottomAnchor.constraint(equalTo: bottomAnchor)
         ])
         self.view.layoutIfNeeded()
+        syncWebViewSafeAreaLayout()
+        refreshWebViewViewportIfNeeded(force: true)
     }
 }
 
@@ -3002,17 +3911,31 @@ class BlockBarButtonItem: UIBarButtonItem {
 
 /// Custom view that passes touches outside a target frame to the underlying view
 class PassThroughView: UIView {
-    var targetFrame: CGRect?
+    var targetFrame: CGRect? {
+        didSet {
+            setNeedsLayout()
+        }
+    }
+    weak var framedContentView: UIView?
 
-    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        // If we have a target frame and the touch is outside it, pass through
-        if let frame = targetFrame {
-            if !frame.contains(point) {
-                return nil  // Pass through to underlying views
-            }
+    override func layoutSubviews() {
+        super.layoutSubviews()
+
+        guard let targetFrame, let framedContentView else {
+            return
         }
 
-        // Otherwise, handle normally
+        framedContentView.frame = targetFrame
+    }
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        // Outside the browser frame: decline the hit. Callers that still use a full-screen
+        // PassThroughView depend on the parent hierarchy continuing hit-testing; framed
+        // front overlays avoid modal UITransitionView entirely instead.
+        if let frame = targetFrame, !frame.contains(point) {
+            return nil
+        }
+
         return super.hitTest(point, with: event)
     }
 }

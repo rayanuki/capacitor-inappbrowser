@@ -2,6 +2,7 @@ import Foundation
 import Capacitor
 import WebKit
 import AuthenticationServices
+import SafariServices
 
 enum ActiveWebViewSupport {
     static func shouldActivateNewWebView(isHidden: Bool, hasActiveWebView: Bool) -> Bool {
@@ -10,6 +11,138 @@ enum ActiveWebViewSupport {
 
     static func resolveVisibilityTarget(originatingWebViewId: String?, activeWebViewId: String?) -> String? {
         originatingWebViewId ?? activeWebViewId
+    }
+}
+
+enum BlankTargetNavigationSupport {
+    enum Action: Equatable {
+        case openExternalApp
+        case loadInCurrentWebView
+        case createPopup
+    }
+
+    /// Decides how a `target=_blank` / new-window request should be handled.
+    static func resolve(
+        urlIsHttpOrHttps: Bool,
+        openBlankTargetInWebView: Bool,
+        preventDeeplink: Bool,
+        isAuthorizedAppLink: Bool
+    ) -> Action {
+        guard urlIsHttpOrHttps else {
+            return .createPopup
+        }
+
+        if isAuthorizedAppLink && !preventDeeplink {
+            return .openExternalApp
+        }
+
+        if openBlankTargetInWebView || preventDeeplink {
+            return .loadInCurrentWebView
+        }
+
+        return .createPopup
+    }
+
+    /// Prefer the parent content VC so we never present from a UINavigationController
+    /// whose root view was replaced (custom width/height PassThroughView).
+    static func popupPresenter(
+        parentController: UIViewController,
+        bridgeViewController: UIViewController?
+    ) -> UIViewController {
+        if parentController.view.window != nil {
+            return parentController
+        }
+
+        if let navigationController = parentController.navigationController,
+           navigationController.view.window != nil {
+            if let visible = navigationController.visibleViewController,
+               visible.view.window != nil {
+                return visible
+            }
+            return navigationController
+        }
+
+        var top = bridgeViewController
+        while let presented = top?.presentedViewController {
+            top = presented
+        }
+        return top ?? parentController
+    }
+
+    static func topPresenter(from root: UIViewController) -> UIViewController {
+        var top = root
+        while let presented = top.presentedViewController {
+            top = presented
+        }
+        return top
+    }
+}
+
+enum AuthorizedAppLinkOpenSupport {
+    enum Outcome: Equatable {
+        case openedExternally
+        case loadInWebView
+    }
+
+    /// Universal Link first; if that fails, system open (App Store / Safari / etc.).
+    /// Only stay in-webview when both external attempts fail.
+    static func resolve(universalLinkOpened: Bool, systemOpenSucceeded: Bool) -> Outcome {
+        if universalLinkOpened || systemOpenSucceeded {
+            return .openedExternally
+        }
+        return .loadInWebView
+    }
+}
+
+enum CustomSchemeOpenSupport {
+    static let alwaysAttemptOpenSchemes = ["tel", "mailto", "sms"]
+
+    /// `canOpenURL` needs LSApplicationQueriesSchemes; `open` does not.
+    /// Always attempt open for Mail/Phone/Messages even when the query fails.
+    static func shouldAttemptOpen(scheme: String?, canOpenURL: Bool) -> Bool {
+        if canOpenURL {
+            return true
+        }
+        guard let scheme = scheme?.lowercased(), !scheme.isEmpty else {
+            return false
+        }
+        return alwaysAttemptOpenSchemes.contains(scheme)
+    }
+}
+
+enum SecureWindowRedirectSupport {
+    /// The auth session reports any navigation on the callback scheme, so the redirect is
+    /// identified component-wise. Query items configured in the redirect URI are matched,
+    /// while any extra items (e.g. provider code, state) are ignored, unless they reuse a
+    /// configured name: parsers disagree over which duplicate takes precedence.
+    static func matches(_ callbackURL: URL, redirectUri: String) -> Bool {
+        guard let expected = URLComponents(string: redirectUri),
+              let received = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false),
+              received.scheme?.lowercased() == expected.scheme?.lowercased(),
+              received.percentEncodedUser == expected.percentEncodedUser,
+              received.percentEncodedPassword == expected.percentEncodedPassword,
+              received.percentEncodedHost?.lowercased() == expected.percentEncodedHost?.lowercased(),
+              received.port == expected.port,
+              normalizedPath(received.percentEncodedPath) == normalizedPath(expected.percentEncodedPath) else {
+            return false
+        }
+
+        let expectedItems = expected.percentEncodedQueryItems ?? []
+        let receivedItems = received.percentEncodedQueryItems ?? []
+        let configuredDecodedNames = Set((expected.queryItems ?? []).map(\.name))
+        let configuredReceivedItemCount = (received.queryItems ?? []).filter {
+            configuredDecodedNames.contains($0.name)
+        }.count
+        guard configuredReceivedItemCount == expectedItems.count else {
+            return false
+        }
+        return Set(expectedItems.map(\.name)).allSatisfy { name in
+            receivedItems.filter { $0.name == name } == expectedItems.filter { $0.name == name }
+        }
+    }
+
+    private static func normalizedPath(_ path: String) -> String {
+        path == "/" ? "" : path
     }
 }
 
@@ -51,6 +184,211 @@ enum ProxyResponseRoutingSupport {
     }
 }
 
+enum StatusBarBackgroundLayoutSupport {
+    enum Placement: Equatable {
+        case skip
+        case host(pinToNavigationBar: Bool)
+    }
+
+    /// Decide where/how to pin the status-bar chrome without painting a custom-frame gap.
+    static func placement(
+        isPassThroughOverlay: Bool,
+        blankNavigationTab: Bool,
+        navigationBarInHostHierarchy: Bool,
+        isFramedCustomOverlay: Bool = false
+    ) -> Placement {
+        // Pre-#629 custom frames used PassThroughView; #629 switched front frames to child
+        // overlays. Both must skip blank status-bar chrome so y/height stay screen-accurate.
+        if (isPassThroughOverlay || isFramedCustomOverlay) && blankNavigationTab {
+            return .skip
+        }
+
+        if blankNavigationTab || !navigationBarInHostHierarchy {
+            return .host(pinToNavigationBar: false)
+        }
+
+        return .host(pinToNavigationBar: true)
+    }
+
+    static func hostView(
+        navigationControllerView: UIView,
+        framedContentView: UIView?
+    ) -> UIView? {
+        if let passThrough = navigationControllerView as? PassThroughView {
+            return framedContentView ?? passThrough.framedContentView
+        }
+        return navigationControllerView
+    }
+}
+
+enum CustomWebViewFrameSupport {
+    /// Resolve openWebView width/height/x/y in screen/window points (Android window attrs).
+    static func resolvedFrame(
+        width: CGFloat?,
+        height: CGFloat?,
+        x positionX: CGFloat?,
+        y positionY: CGFloat?,
+        fallbackSize: CGSize
+    ) -> CGRect? {
+        guard let height else {
+            return nil
+        }
+
+        return CGRect(
+            x: positionX ?? 0,
+            y: positionY ?? 0,
+            width: width ?? fallbackSize.width,
+            height: height
+        )
+    }
+
+    static func screenSize(for view: UIView?) -> CGSize {
+        if let window = view?.window {
+            return window.bounds.size
+        }
+        return UIScreen.main.bounds.size
+    }
+
+    static func hostOriginInScreen(for host: UIView) -> CGPoint {
+        if let window = host.window {
+            return host.convert(.zero, to: window)
+        }
+        // Outside a window (unit tests / early layout): treat frame.origin as screen-space.
+        return host.frame.origin
+    }
+
+    /// Convert a screen-space custom frame into the host view's coordinate space.
+    static func frameInHost(
+        width: CGFloat?,
+        height: CGFloat?,
+        x positionX: CGFloat?,
+        y positionY: CGFloat?,
+        screenSize: CGSize,
+        hostOriginInScreen: CGPoint
+    ) -> CGRect? {
+        guard let screenFrame = resolvedFrame(
+            width: width,
+            height: height,
+            x: positionX,
+            y: positionY,
+            fallbackSize: screenSize
+        ) else {
+            return nil
+        }
+
+        return CGRect(
+            x: screenFrame.origin.x - hostOriginInScreen.x,
+            y: screenFrame.origin.y - hostOriginInScreen.y,
+            width: screenFrame.width,
+            height: screenFrame.height
+        )
+    }
+}
+
+enum BrowsingDataStoreSupport {
+    /// Stable identifier for the plugin-owned persistent website data store (iOS 17+).
+    /// Keeps InAppBrowser cookies/storage separate from the Capacitor/Ionic host WKWebView.
+    static let persistentStoreIdentifier = UUID(uuidString: "C4A96F00-1A8B-4650-9E55-1A8B00000650")!
+
+    static func websiteDataStore(persistWebViewData: Bool, useSharedDataStore: Bool = false) -> WKWebsiteDataStore {
+        guard persistWebViewData else {
+            return .nonPersistent()
+        }
+        if useSharedDataStore {
+            return .default()
+        }
+        return persistentWebsiteDataStore()
+    }
+
+    static func persistentWebsiteDataStore() -> WKWebsiteDataStore {
+        if #available(iOS 17.0, *) {
+            return WKWebsiteDataStore(forIdentifier: persistentStoreIdentifier)
+        }
+        // Custom persistent stores require iOS 17+. Older OS versions share the default store.
+        return .default()
+    }
+
+    /// Host Capacitor apps use `WKWebsiteDataStore.default()`. Clearing it wipes Ionic storage.
+    static func isHostAppWebsiteDataStore(_ store: WKWebsiteDataStore) -> Bool {
+        ObjectIdentifier(store) == ObjectIdentifier(WKWebsiteDataStore.default())
+    }
+
+    /// Stores owned by InAppBrowser only. Never includes the Capacitor/Ionic default store.
+    static func storesForClearAllBrowsingData(openStores: [WKWebsiteDataStore]) -> [WKWebsiteDataStore] {
+        var seen = Set<ObjectIdentifier>()
+        var stores: [WKWebsiteDataStore] = []
+
+        func append(_ store: WKWebsiteDataStore) {
+            guard !isHostAppWebsiteDataStore(store) else { return }
+            let identifier = ObjectIdentifier(store)
+            if seen.insert(identifier).inserted {
+                stores.append(store)
+            }
+        }
+
+        if #available(iOS 17.0, *) {
+            append(WKWebsiteDataStore(forIdentifier: persistentStoreIdentifier))
+        }
+        for store in openStores {
+            append(store)
+        }
+        return stores
+    }
+
+    /// When no managed webview is open, only return a store that is not the host app store.
+    static func fallbackStoresWhenNoWebViewOpen() -> [WKWebsiteDataStore] {
+        if #available(iOS 17.0, *) {
+            return [WKWebsiteDataStore(forIdentifier: persistentStoreIdentifier)]
+        }
+        return []
+    }
+}
+
+enum ReloadGestureSupport {
+    /// Ordinary page finishes must not clear an armed pull still held by the user.
+    static func shouldApplyStopReloadGesture(reloadFromGestureInProgress: Bool) -> Bool {
+        reloadFromGestureInProgress
+    }
+
+    /// UIRefreshControl may fire valueChanged while the finger is still down.
+    /// Match browser UX: commit reload only after touch end.
+    static func shouldDeferReloadUntilTouchEnd(isTracking: Bool, isDragging: Bool) -> Bool {
+        isTracking || isDragging
+    }
+
+    /// Pull distance below the resting top (adjusted inset). Positive when overscrolling down.
+    static func pullDistance(contentOffsetY: CGFloat, adjustedContentInsetTop: CGFloat) -> CGFloat {
+        max(0, -(contentOffsetY + adjustedContentInsetTop))
+    }
+
+    /// After intentional touch end, reload only if still near the activation pull distance
+    /// captured when UIRefreshControl fired `.valueChanged` (not a fixed constant).
+    static func shouldReloadOnTouchEnd(
+        pendingReload: Bool,
+        currentPullDistance: CGFloat,
+        armedPullDistance: CGFloat
+    ) -> Bool {
+        guard pendingReload, armedPullDistance > 0 else { return false }
+        // Allow slight finger jitter below the exact activation point.
+        return currentPullDistance >= armedPullDistance * 0.9
+    }
+
+    /// Resting offset after gesture reload.
+    /// Plugin safe-area uses CSS variables with `contentInset = .zero`, so forced reset is always `0`.
+    /// - Parameter forceToRestingTop: After gesture reload, snap to top. Otherwise only un-overscroll.
+    static func contentOffsetYAfterReloadReset(
+        currentY: CGFloat,
+        adjustedContentInsetTop: CGFloat,
+        forceToRestingTop: Bool = false
+    ) -> CGFloat {
+        if forceToRestingTop {
+            return 0
+        }
+        let restingY = -adjustedContentInsetTop
+        return currentY < restingY ? restingY : currentY
+    }
+}
+
 extension UIColor {
 
     convenience init(hexString: String) {
@@ -71,15 +409,15 @@ extension UIColor {
  * Please read the Capacitor iOS Plugin Development Guide
  * here: https://capacitorjs.com/docs/plugins/ios
  */
-@objc(InAppBrowserPlugin)
-public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
+@objc(CapgoInAppBrowserPlugin)
+public class CapgoInAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
     enum InvisibilityMode: String {
         case aware = "AWARE"
         case fakeVisible = "FAKE_VISIBLE"
     }
-    private let pluginVersion: String = "8.6.13"
-    public let identifier = "InAppBrowserPlugin"
-    public let jsName = "InAppBrowser"
+    private let pluginVersion: String = "8.15.2"
+    public let identifier = "CapgoInAppBrowserPlugin"
+    public let jsName = "CapgoInAppBrowser"
     public let pluginMethods: [CAPPluginMethod] = [
         CAPPluginMethod(name: "goBack", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "open", returnType: CAPPluginReturnPromise),
@@ -88,10 +426,14 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "getCookies", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "clearAllCookies", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "clearCache", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "clearAllBrowsingData", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "reload", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setUrl", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "show", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "hide", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "sendToBack", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "bringToFront", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "dispatchInputEvent", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "close", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "executeScript", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "postMessage", returnType: CAPPluginReturnPromise),
@@ -114,16 +456,25 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
     var webViewController: WKWebViewController?
     private var webViewControllers: [String: WKWebViewController] = [:]
     private var proxySchemeHandlers: [String: ProxySchemeHandler] = [:]
+    private var proxyBridges: [String: ProxyBridge] = [:]
     private var webViewStack: [String] = []
     private var activeWebViewId: String?
-    private weak var presentationContainerView: UIView?
-    private var presentationContainerWasInteractive = true
-    private var presentationContainerPreviousAlpha: CGFloat = 1
     private var hiddenWebViewContainers: [ObjectIdentifier: UIView] = [:]
     private var closeModalTitle: String?
+    private var layeredWebViewIds = Set<String>()
+    private var framedOverlayWebViewIds = Set<String>()
+    private var transparentHostWebViewIds = Set<String>()
+    private var hasStoredHostWebViewAppearance = false
+    private var originalHostWebViewBackgroundColor: UIColor?
+    private var originalHostWebViewIsOpaque = true
+    private var originalHostSubviewBackgrounds: [(UIView, UIColor?, Bool)] = []
+    private var originalHostSuperviewBackgroundColor: UIColor?
+    private var originalHostSuperviewIsOpaque = true
     private var closeModalDescription: String?
     private var closeModalOk: String?
     private var closeModalCancel: String?
+    private var safariViewController: SFSafariViewController?
+    private var safariOpenedUrl: String?
     private var openSecureWindowCall: CAPPluginCall?
 
     private func setup() {
@@ -159,12 +510,27 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
+    private func dismissNavigationControllerIfPresented(_ navigationController: UINavigationController?, completion: (() -> Void)? = nil) {
+        guard let navigationController else {
+            completion?()
+            return
+        }
+        guard navigationController.presentingViewController != nil else {
+            completion?()
+            return
+        }
+        navigationController.dismiss(animated: false, completion: completion)
+    }
+
     private func unregisterWebView(id: String) {
+        detachFramedOverlayWebView(id: id)
+        detachLayeredWebView(id: id)
         if let webView = webViewControllers[id]?.capableWebView {
             cleanupHiddenWebViewContainer(for: webView)
         }
         proxySchemeHandlers[id]?.cancelAllPendingTasks()
         proxySchemeHandlers[id] = nil
+        proxyBridges[id] = nil
         webViewControllers[id] = nil
         navigationControllers[id] = nil
         webViewStack.removeAll { $0 == id }
@@ -229,9 +595,7 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
     ) -> WKWebView? {
         let popupId = UUID().uuidString
         let shouldHidePopup = parentController.hiddenPopupWindow
-        if let parentWebView = parentController.capableWebView {
-            configuration.processPool = parentWebView.configuration.processPool
-        }
+        // WKProcessPool sharing is automatic on iOS 15+; explicit assignment is deprecated.
         if let dataStore = parentController.websiteDataStore() {
             configuration.websiteDataStore = dataStore
         }
@@ -271,8 +635,25 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
                 return nil
             }
         } else {
-            let presenter = self.bridge?.viewController?.presentedViewController ?? self.bridge?.viewController
-            presenter?.present(navigationController, animated: true, completion: nil)
+            navigationController.modalPresentationStyle = .overFullScreen
+            navigationController.modalTransitionStyle = .crossDissolve
+
+            let presenter = BlankTargetNavigationSupport.popupPresenter(
+                parentController: parentController,
+                bridgeViewController: self.bridge?.viewController
+            )
+            presentNavigationControllerSafely(navigationController, from: presenter, animated: true) { [weak self] presented in
+                if !presented {
+                    self?.unregisterWebView(id: popupId)
+                }
+                self?.notifyPopupWindowOpened(
+                    id: popupId,
+                    parentId: parentController.instanceId,
+                    url: navigationAction.request.url?.absoluteString,
+                    visible: presented
+                )
+            }
+            return popupWebView
         }
         notifyPopupWindowOpened(
             id: popupId,
@@ -281,6 +662,43 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
             visible: !shouldHidePopup
         )
         return popupWebView
+    }
+
+    private func presentNavigationControllerSafely(
+        _ navigationController: UINavigationController,
+        from presenter: UIViewController?,
+        animated: Bool,
+        completion: ((Bool) -> Void)? = nil
+    ) {
+        guard let presenter else {
+            completion?(false)
+            return
+        }
+
+        let presentBlock = {
+            if navigationController.presentingViewController != nil {
+                completion?(true)
+                return
+            }
+
+            let top = BlankTargetNavigationSupport.topPresenter(from: presenter)
+            guard top.presentedViewController == nil else {
+                print("[InAppBrowser] Skipping present; presenter already has a presented VC")
+                completion?(false)
+                return
+            }
+            top.present(navigationController, animated: animated) {
+                completion?(true)
+            }
+        }
+
+        if Thread.isMainThread,
+           !presenter.isBeingPresented,
+           !presenter.isBeingDismissed {
+            presentBlock()
+        } else {
+            DispatchQueue.main.async(execute: presentBlock)
+        }
     }
 
     private func resolveWebViewController(for id: String?) -> WKWebViewController? {
@@ -305,7 +723,7 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
 
         let controllers = Array(webViewControllers.values)
         if controllers.isEmpty {
-            return [WKWebsiteDataStore.default()]
+            return BrowsingDataStoreSupport.fallbackStoresWhenNoWebViewOpen()
         }
 
         var seen = Set<ObjectIdentifier>()
@@ -321,11 +739,16 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         return stores
     }
 
+    private func allBrowsingDataStores() -> [WKWebsiteDataStore] {
+        let openStores = webViewControllers.values.compactMap { $0.websiteDataStore() }
+        return BrowsingDataStoreSupport.storesForClearAllBrowsingData(openStores: openStores)
+    }
+
     private func parseProxyRules(_ rawRules: [Any]) throws -> [NativeProxyRule] {
         try rawRules.enumerated().map { index, item in
             guard let dictionary = item as? [String: Any] else {
                 throw NSError(
-                    domain: "InAppBrowserPlugin",
+                    domain: "CapgoInAppBrowserPlugin",
                     code: -1,
                     userInfo: [NSLocalizedDescriptionKey: "Proxy rule at index \(index) must be an object"]
                 )
@@ -334,18 +757,121 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
-    func presentView(webViewId: String? = nil, isAnimated: Bool = true) {
+    @discardableResult
+    func presentView(webViewId: String? = nil, isAnimated: Bool = true) -> Bool {
         let resolvedId = webViewId ?? activeWebViewId
         let navigationController = resolvedId.flatMap { navigationControllers[$0] } ?? self.navigationWebViewController
         guard let navigationController else {
             self.currentPluginCall?.reject("Navigation controller is not initialized")
+            return false
+        }
+
+        if let resolvedId,
+           let webViewController = webViewControllers[resolvedId],
+           webViewController.isLayeredBehind {
+            if !sendNavigationControllerToBack(id: resolvedId, transparentBackground: webViewController.transparentHostBackground) {
+                self.currentPluginCall?.reject("Failed to send webview to back")
+                return false
+            }
+            return true
+        }
+
+        if let resolvedId,
+           let webViewController = webViewControllers[resolvedId],
+           webViewController.shouldPresentAsFramedOverlay {
+            dismissActiveKeyboard()
+            if presentNavigationControllerAsFramedOverlay(id: resolvedId) {
+                // openWebView resolves with the webView id; do not resolve here.
+                return true
+            }
+            self.currentPluginCall?.reject("Failed to present webview")
+            return false
+        }
+
+        if let resolvedId {
+            detachFramedOverlayWebView(id: resolvedId)
+            detachLayeredWebView(id: resolvedId)
+        }
+        dismissActiveKeyboard()
+        let presenter = self.bridge?.viewController?.presentedViewController ?? self.bridge?.viewController
+        presentNavigationControllerSafely(navigationController, from: presenter, animated: isAnimated) { presented in
+            if !presented {
+                // openWebView already resolves with the webView id on success.
+                // Resolving here caused a double-resolve (empty, then with id). See #631.
+                self.currentPluginCall?.reject("Failed to present webview")
+            }
+        }
+        return true
+    }
+
+    private func storeSubviewBackgrounds(from view: UIView) {
+        for subview in view.subviews {
+            originalHostSubviewBackgrounds.append((subview, subview.backgroundColor, subview.isOpaque))
+            storeSubviewBackgrounds(from: subview)
+        }
+    }
+
+    private func clearBackgrounds(in view: UIView) {
+        view.isOpaque = false
+        view.backgroundColor = .clear
+        view.subviews.forEach { clearBackgrounds(in: $0) }
+    }
+
+    private func makeHostWebViewTransparent(for id: String) {
+        guard let hostWebView = self.bridge?.webView else {
             return
         }
 
-        let presenter = self.bridge?.viewController?.presentedViewController ?? self.bridge?.viewController
-        presenter?.present(navigationController, animated: isAnimated, completion: {
-            self.currentPluginCall?.resolve()
-        })
+        transparentHostWebViewIds.insert(id)
+        if !hasStoredHostWebViewAppearance {
+            hasStoredHostWebViewAppearance = true
+            originalHostWebViewBackgroundColor = hostWebView.backgroundColor
+            originalHostWebViewIsOpaque = hostWebView.isOpaque
+            originalHostSuperviewBackgroundColor = hostWebView.superview?.backgroundColor
+            originalHostSuperviewIsOpaque = hostWebView.superview?.isOpaque ?? true
+            originalHostSubviewBackgrounds.removeAll()
+            storeSubviewBackgrounds(from: hostWebView)
+        }
+
+        clearBackgrounds(in: hostWebView)
+        hostWebView.superview?.isOpaque = false
+        hostWebView.superview?.backgroundColor = .clear
+        hostWebView.setNeedsLayout()
+        hostWebView.layoutIfNeeded()
+    }
+
+    private func restoreHostWebViewBackgroundIfNeeded(for id: String? = nil) {
+        if let id {
+            transparentHostWebViewIds.remove(id)
+        } else {
+            transparentHostWebViewIds.removeAll()
+        }
+        guard transparentHostWebViewIds.isEmpty, hasStoredHostWebViewAppearance else {
+            return
+        }
+
+        if let hostWebView = self.bridge?.webView {
+            hostWebView.backgroundColor = originalHostWebViewBackgroundColor
+            hostWebView.isOpaque = originalHostWebViewIsOpaque
+            hostWebView.superview?.backgroundColor = originalHostSuperviewBackgroundColor
+            hostWebView.superview?.isOpaque = originalHostSuperviewIsOpaque
+            for (view, backgroundColor, isOpaque) in originalHostSubviewBackgrounds {
+                view.backgroundColor = backgroundColor
+                view.isOpaque = isOpaque
+            }
+            hostWebView.setNeedsLayout()
+            hostWebView.layoutIfNeeded()
+        }
+
+        hasStoredHostWebViewAppearance = false
+        originalHostWebViewBackgroundColor = nil
+        originalHostSuperviewBackgroundColor = nil
+        originalHostSubviewBackgrounds.removeAll()
+    }
+
+    private func dismissActiveKeyboard() {
+        self.bridge?.webView?.endEditing(true)
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
     }
 
     private func activeWindow() -> UIWindow? {
@@ -483,6 +1009,23 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         self.navigationWebViewController = nil
     }
 
+    func handleWebViewDidHide(id: String, url: String, screenshot: [String: Any]? = nil) {
+        var payload: [String: Any] = ["url": url]
+        if let screenshot {
+            payload["screenshot"] = screenshot
+        }
+
+        if !id.isEmpty {
+            payload["id"] = id
+            self.notifyListeners("hideEvent", data: payload)
+            self.setHiddenState(true, targetId: id, call: nil)
+            return
+        }
+
+        self.notifyListeners("hideEvent", data: payload)
+        self.setHiddenState(true, targetId: activeWebViewId, call: nil)
+    }
+
     @objc func clearAllCookies(_ call: CAPPluginCall) {
         DispatchQueue.main.async {
             let targetId = call.getString("id")
@@ -527,6 +1070,24 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
             }
 
             let dataTypes = Set([WKWebsiteDataTypeDiskCache, WKWebsiteDataTypeMemoryCache])
+            let group = DispatchGroup()
+            for dataStore in dataStores {
+                group.enter()
+                dataStore.removeData(ofTypes: dataTypes,
+                                     modifiedSince: Date(timeIntervalSince1970: 0)) {
+                    group.leave()
+                }
+            }
+            group.notify(queue: .main) {
+                call.resolve()
+            }
+        }
+    }
+
+    @objc func clearAllBrowsingData(_ call: CAPPluginCall) {
+        DispatchQueue.main.async {
+            let dataStores = self.allBrowsingDataStores()
+            let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()
             let group = DispatchGroup()
             for dataStore in dataStores {
                 group.enter()
@@ -596,7 +1157,7 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         }
 
         DispatchQueue.main.async {
-            WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+            BrowsingDataStoreSupport.persistentWebsiteDataStore().httpCookieStore.getAllCookies { cookies in
                 var cookieDict = [String: String]()
                 for cookie in cookies {
 
@@ -610,6 +1171,84 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
 
     }
 
+    private func optionError(_ message: String) -> NSError {
+        NSError(domain: "CapgoInAppBrowser", code: 0, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
+    private func loadToolbarIcon(from iosSettings: JSObject, optionName: String) throws -> UIImage {
+        guard let iconType = iosSettings["iconType"] as? String, !iconType.isEmpty else {
+            throw optionError("\(optionName).ios.iconType is empty")
+        }
+        guard iconType == "sf-symbol" || iconType == "asset" else {
+            throw optionError("\(optionName).ios.iconType must be 'sf-symbol' or 'asset'")
+        }
+        guard let icon = iosSettings["icon"] as? String, !icon.isEmpty else {
+            throw optionError("\(optionName).ios.icon is empty")
+        }
+
+        if iconType == "sf-symbol" {
+            guard let image = UIImage(systemName: icon)?.withRenderingMode(.alwaysTemplate) else {
+                throw optionError("Failed to load \(optionName) SF Symbol: \(icon)")
+            }
+            return image
+        }
+
+        let paths = [
+            icon,
+            "public/\(icon)",
+            icon.replacingOccurrences(of: "public/", with: "")
+        ]
+
+        for path in paths {
+            let assetPath = path.replacingOccurrences(of: "public/", with: "")
+            if let webDir = Bundle.main.resourceURL?.appendingPathComponent("public") {
+                let fileURL = webDir.appendingPathComponent(assetPath)
+                if FileManager.default.fileExists(atPath: fileURL.path),
+                   let data = try? Data(contentsOf: fileURL),
+                   let image = UIImage(data: data) {
+                    return image.withRenderingMode(.alwaysTemplate)
+                }
+            }
+
+            if let wwwDir = Bundle.main.resourceURL?.appendingPathComponent("www") {
+                let wwwFileURL = wwwDir.appendingPathComponent(assetPath)
+                if FileManager.default.fileExists(atPath: wwwFileURL.path),
+                   let data = try? Data(contentsOf: wwwFileURL),
+                   let image = UIImage(data: data) {
+                    return image.withRenderingMode(.alwaysTemplate)
+                }
+            }
+
+            if let image = UIImage(named: path) {
+                return image.withRenderingMode(.alwaysTemplate)
+            }
+        }
+        throw optionError("Failed to load \(optionName) icon: \(icon)")
+    }
+
+    private func bundledAssetLocalConfig() -> BundledAssetSupport.LocalConfig {
+        BundledAssetSupport.parseLocalConfig(from: self.bridge?.config.localURL) ?? BundledAssetSupport.iosDefaults
+    }
+
+    private func applyBundledAssetSettings(to webViewController: WKWebViewController) {
+        // Scheme handlers are registered once during initWebview; localURL is fixed for the app lifetime.
+        let localConfig = bundledAssetLocalConfig()
+        webViewController.bundledAssetLocalScheme = BundledAssetSupport.handlerScheme(for: localConfig)
+        webViewController.bundledAssetLocalHost = localConfig.host
+    }
+
+    private func webSource(for urlString: String) -> WKWebSource? {
+        if let html = HtmlDataUrlSupport.parseHtml(from: urlString) {
+            return .string(html, base: nil)
+        }
+
+        guard let resolution = BundledAssetSupport.resolve(urlString, localURL: self.bridge?.config.localURL),
+              let url = URL(string: resolution.url) else {
+            return nil
+        }
+
+        return .remote(url)
+    }
     @objc func openWebView(_ call: CAPPluginCall) {
         if !self.isSetupDone {
             self.setup()
@@ -640,84 +1279,25 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
                 call.reject("IOS settings are not an object")
                 return
             }
-
-            guard let iconType = iosSettings["iconType"] as? String else {
-                call.reject("buttonNearDone.iconType is empty")
+            do {
+                buttonNearDoneIcon = try self.loadToolbarIcon(from: iosSettings, optionName: "buttonNearDone")
+            } catch {
+                call.reject(error.localizedDescription)
                 return
             }
-            if iconType != "sf-symbol" && iconType != "asset" {
-                call.reject("IconType is neither 'sf-symbol' nor 'asset'")
+        }
+
+        var titleIcon: UIImage?
+        if let titleIconSettings = call.getObject("titleIcon"), let iosSettingsRaw = titleIconSettings["ios"] {
+            guard let iosSettings = iosSettingsRaw as? JSObject else {
+                call.reject("titleIcon.ios settings are not an object")
                 return
             }
-            guard let icon = iosSettings["icon"] as? String else {
-                call.reject("buttonNearDone.icon is empty")
+            do {
+                titleIcon = try self.loadToolbarIcon(from: iosSettings, optionName: "titleIcon")
+            } catch {
+                call.reject(error.localizedDescription)
                 return
-            }
-
-            if iconType == "sf-symbol" {
-                buttonNearDoneIcon = UIImage(systemName: icon)?.withRenderingMode(.alwaysTemplate)
-                print("[DEBUG] Set buttonNearDone SF Symbol icon: \(icon)")
-            } else {
-                // Look in app's web assets/public directory
-                guard let webDir = Bundle.main.resourceURL?.appendingPathComponent("public") else {
-                    call.reject("Failed to locate bundled web assets")
-                    return
-                }
-
-                // Try several path combinations to find the asset
-                let paths = [
-                    icon,                    // Just the icon name
-                    "public/\(icon)",        // With public/ prefix
-                    icon.replacingOccurrences(of: "public/", with: "")  // Without public/ prefix
-                ]
-
-                var foundImage = false
-
-                for path in paths {
-                    // Try as a direct path from web assets dir
-                    let assetPath = path.replacingOccurrences(of: "public/", with: "")
-                    let fileURL = webDir.appendingPathComponent(assetPath)
-
-                    print("[DEBUG] Trying to load from: \(fileURL.path)")
-
-                    if FileManager.default.fileExists(atPath: fileURL.path),
-                       let data = try? Data(contentsOf: fileURL),
-                       let img = UIImage(data: data) {
-                        buttonNearDoneIcon = img.withRenderingMode(.alwaysTemplate)
-                        print("[DEBUG] Successfully loaded buttonNearDone from web assets: \(fileURL.path)")
-                        foundImage = true
-                        break
-                    }
-
-                    // Try with www directory as an alternative
-                    if let wwwDir = Bundle.main.resourceURL?.appendingPathComponent("www") {
-                        let wwwFileURL = wwwDir.appendingPathComponent(assetPath)
-
-                        print("[DEBUG] Trying to load from www dir: \(wwwFileURL.path)")
-
-                        if FileManager.default.fileExists(atPath: wwwFileURL.path),
-                           let data = try? Data(contentsOf: wwwFileURL),
-                           let img = UIImage(data: data) {
-                            buttonNearDoneIcon = img.withRenderingMode(.alwaysTemplate)
-                            print("[DEBUG] Successfully loaded buttonNearDone from www dir: \(wwwFileURL.path)")
-                            foundImage = true
-                            break
-                        }
-                    }
-
-                    // Try looking in app bundle assets
-                    if let iconImage = UIImage(named: path) {
-                        buttonNearDoneIcon = iconImage.withRenderingMode(.alwaysTemplate)
-                        print("[DEBUG] Successfully loaded buttonNearDone from app bundle: \(path)")
-                        foundImage = true
-                        break
-                    }
-                }
-
-                if !foundImage {
-                    call.reject("Failed to load buttonNearDone icon: \(icon)")
-                    return
-                }
             }
         }
 
@@ -733,19 +1313,30 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         let closeModalOk = call.getString("closeModalOk", "OK")
         let closeModalCancel = call.getString("closeModalCancel", "Cancel")
         let closeModalURLPattern = call.getString("closeModalURLPattern")
-        let isInspectable = call.getBool("isInspectable", false)
+        let closeAction = call.getString("closeAction", "close").lowercased()
+        guard closeAction == "close" || closeAction == "hide" else {
+            call.reject("closeAction must be 'close' or 'hide'")
+            return
+        }
+        let titleFontFamily = call.getString("titleFontFamily")
+        let isInspectable = call.getBool("isInspectable", self.bridge?.config.isWebDebuggable ?? false)
         let preventDeeplink = call.getBool("preventDeeplink", false)
         let openBlankTargetInWebView = call.getBool("openBlankTargetInWebView", false)
         let isAnimated = call.getBool("isAnimated", true)
         let enabledSafeBottomMargin = call.getBool("enabledSafeBottomMargin", false)
         let enabledSafeTopMargin = call.getBool("enabledSafeTopMargin", true)
         let hidden = call.getBool("hidden", false)
+        let toBack = call.getBool("toBack", false)
+        let transparentBackground = call.getBool("transparentBackground", true)
         self.isHidden = hidden
         let hiddenPopupWindow = call.getBool("hiddenPopupWindow", false)
         let allowWebViewJsVisibilityControl = self.getConfig().getBoolean("allowWebViewJsVisibilityControl", false)
         let allowScreenshotsFromWebPage = call.getBool("allowScreenshotsFromWebPage", false)
+        let screenshotOnHide = call.getBool("screenshotOnHide", false)
         let captureConsoleLogs = call.getBool("captureConsoleLogs", false)
         let handleDownloads = call.getBool("handleDownloads", false)
+        let persistWebViewData = call.getBool("persistWebViewData", true)
+        let useSharedDataStore = call.getBool("useSharedDataStore", false)
         let invisibilityModeRaw = call.getString("invisibilityMode", "AWARE")
         self.invisibilityMode = InvisibilityMode(rawValue: invisibilityModeRaw.uppercased()) ?? .aware
 
@@ -841,6 +1432,7 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
 
         // Read disableOverscroll option (iOS only - controls WebView bounce effect)
         let disableOverscroll = call.getBool("disableOverscroll", false)
+        let enableReloadGesture = call.getBool("enableReloadGesture", false)
 
         let legacyProxyRequests = ProxySchemeRequestSupport.legacyProxyRequestsConfiguration(from: call.options["proxyRequests"])
         let outboundProxyRulesRaw = call.getArray("outboundProxyRules", [])
@@ -862,53 +1454,69 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         }
 
         DispatchQueue.main.async {
-            guard let url = URL(string: urlString) else {
+            let webSourceResult = self.webSource(for: urlString)
+            guard let webSource = webSourceResult else {
                 call.reject("Invalid URL format")
                 return
             }
 
             var proxyHandler: ProxySchemeHandler?
+            var proxyBridge: ProxyBridge?
+            var proxyBridgeAccessToken: String?
             if legacyProxyRequests.isEnabled || !outboundProxyRules.isEmpty || !inboundProxyRules.isEmpty {
+                let bridgeAccessToken = UUID().uuidString
+                proxyBridgeAccessToken = bridgeAccessToken
+                proxyBridge = ProxyBridge(accessToken: bridgeAccessToken)
                 proxyHandler = ProxySchemeHandler(
                     plugin: self,
                     webviewId: webViewId,
                     legacyProxyRequests: legacyProxyRequests.isEnabled,
                     legacyProxyRequestURLRegex: legacyProxyRequests.urlRegex,
                     outboundRules: outboundProxyRules,
-                    inboundRules: inboundProxyRules
+                    inboundRules: inboundProxyRules,
+                    proxyBridge: proxyBridge
                 )
                 self.proxySchemeHandlers[webViewId] = proxyHandler
+                self.proxyBridges[webViewId] = proxyBridge
             }
 
-            self.webViewController = WKWebViewController.init(
-                url: url,
-                headers: headers,
-                isInspectable: isInspectable,
-                credentials: credentials,
-                preventDeeplink: preventDeeplink,
-                blankNavigationTab: toolbarType == "blank",
-                enabledSafeBottomMargin: enabledSafeBottomMargin,
-                enabledSafeTopMargin: enabledSafeTopMargin,
-                blockedHosts: blockedHosts,
+            let webViewController = WKWebViewController()
+            webViewController.blankNavigationTab = toolbarType == "blank"
+            webViewController.enabledSafeBottomMargin = enabledSafeBottomMargin
+            webViewController.enabledSafeTopMargin = enabledSafeTopMargin
+            webViewController.source = webSource
+            webViewController.setCredentials(credentials: credentials)
+            webViewController.allowWebViewJsVisibilityControl = allowWebViewJsVisibilityControl
+            webViewController.allowScreenshotsFromWebPage = allowScreenshotsFromWebPage
+            webViewController.captureConsoleLogs = captureConsoleLogs
+            webViewController.proxyRequests = legacyProxyRequests.isEnabled
+            webViewController.proxySchemeHandler = proxyHandler
+            webViewController.proxyBridge = proxyBridge
+            webViewController.proxyBridgeAccessToken = proxyBridgeAccessToken
+            webViewController.legacyProxyRequestURLRegexPattern = legacyProxyRequests.urlRegex?.pattern
+            webViewController.openBlankTargetInWebView = openBlankTargetInWebView
+            webViewController.persistWebViewData = persistWebViewData
+            webViewController.useSharedDataStore = useSharedDataStore
+            webViewController.setHeaders(headers: headers)
+            if let customUserAgent = call.getString("customUserAgent"), !customUserAgent.isEmpty {
+                webViewController.customUserAgent = customUserAgent
+            }
+            webViewController.setPreventDeeplink(preventDeeplink: preventDeeplink)
+            webViewController.setBlockedHosts(blockedHosts: blockedHosts)
+            webViewController.setAuthorizedAppLinks(authorizedAppLinks: authorizedAppLinks)
+            webViewController.documentStartUserScripts = self.documentStartUserScripts(
                 authorizedAppLinks: authorizedAppLinks,
-                allowWebViewJsVisibilityControl: allowWebViewJsVisibilityControl,
-                allowScreenshotsFromWebPage: allowScreenshotsFromWebPage,
-                captureConsoleLogs: captureConsoleLogs,
-                proxyRequests: legacyProxyRequests.isEnabled,
-                proxySchemeHandler: proxyHandler,
-                documentStartUserScripts: self.documentStartUserScripts(
-                    authorizedAppLinks: authorizedAppLinks,
-                    openBlankTargetInWebView: openBlankTargetInWebView
-                ),
                 openBlankTargetInWebView: openBlankTargetInWebView
             )
-
-            guard let webViewController = self.webViewController else {
-                call.reject("Failed to initialize WebViewController")
-                return
-            }
+            self.applyBundledAssetSettings(to: webViewController)
+            webViewController.enableReloadGesture = enableReloadGesture
+            webViewController.disableOverscroll = disableOverscroll
+            webViewController.initWebview(isInspectable: isInspectable)
+            self.webViewController = webViewController
 
             webViewController.instanceId = webViewId
+            webViewController.isLayeredBehind = toBack
+            webViewController.transparentHostBackground = transparentBackground
 
             // Set HTTP method and body if provided
             if let method = httpMethod {
@@ -932,8 +1540,6 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
                 webViewController.customY = CGFloat(yPos)
             }
 
-            // Set disableOverscroll option
-            webViewController.disableOverscroll = disableOverscroll
             webViewController.handleDownloads = handleDownloads
 
             // Set native navigation gestures before view loads
@@ -952,7 +1558,7 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
                 }
             }
 
-            webViewController.source = .remote(url)
+            webViewController.source = webSource
             webViewController.leftNavigationBarItemTypes = []
 
             // Configure close button based on showArrow
@@ -1030,6 +1636,10 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
 
             webViewController.capBrowserPlugin = self
             webViewController.title = call.getString("title", "New Window")
+            webViewController.closeAction = closeAction
+            webViewController.screenshotOnHide = screenshotOnHide
+            webViewController.titleFontFamily = titleFontFamily
+            webViewController.titleIcon = titleIcon
             // Only set shareSubject if not already set for activity mode
             if webViewController.shareSubject == nil {
                 webViewController.shareSubject = call.getString("shareSubject")
@@ -1139,42 +1749,11 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
                 webViewController.updateStatusBarStyle()
 
             }
+            webViewController.updateTitleAppearance()
 
-            // Configure modal presentation for touch passthrough if custom dimensions are set
-            if width != nil || height != nil {
-                self.navigationWebViewController?.modalPresentationStyle = .overFullScreen
-
-                // Create a pass-through container
-                let containerView = PassThroughView()
-                containerView.backgroundColor = .clear
-
-                // Calculate dimensions - use screen width if only height is provided
-                let finalWidth = width.map { CGFloat($0) } ?? UIScreen.main.bounds.width
-                let finalHeight = height.map { CGFloat($0) } ?? UIScreen.main.bounds.height
-
-                containerView.targetFrame = CGRect(
-                    x: CGFloat(xPos ?? 0),
-                    y: CGFloat(yPos ?? 0),
-                    width: finalWidth,
-                    height: finalHeight
-                )
-
-                // Replace the navigation controller's view with our pass-through container
-                if let navController = self.navigationWebViewController,
-                   let originalView = navController.view {
-                    navController.view = containerView
-                    containerView.addSubview(originalView)
-                    originalView.frame = CGRect(
-                        x: CGFloat(xPos ?? 0),
-                        y: CGFloat(yPos ?? 0),
-                        width: finalWidth,
-                        height: finalHeight
-                    )
-                }
-            } else {
-                self.navigationWebViewController?.modalPresentationStyle = .overCurrentContext
-            }
-
+            // Custom width/height front browsers are attached as framed child overlays in
+            // presentView (matching Android window sizing) so host taps outside the frame work.
+            self.navigationWebViewController?.modalPresentationStyle = .overCurrentContext
             self.navigationWebViewController?.modalTransitionStyle = .crossDissolve
             if toolbarType == "blank" {
                 self.navigationWebViewController?.navigationBar.isHidden = true
@@ -1191,14 +1770,10 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
                     // Apply status bar background color via the special view
                     webViewController.setupStatusBarBackground(color: color)
 
-                    // Apply background color to whole view to ensure no gaps
+                    // Color the webview controller only — never paint PassThroughView or the
+                    // y-offset gap would hide the host Capacitor app.
                     webViewController.view.backgroundColor = color
-                    self.navigationWebViewController?.view.backgroundColor = color
-
-                    // Apply status bar background color
-                    if let navController = self.navigationWebViewController {
-                        navController.view.backgroundColor = color
-                    }
+                    self.applyBlankToolbarBackground(color, to: self.navigationWebViewController)
                 } else {
                     // Follow system appearance if no specific color
                     let isDarkMode = UITraitCollection.current.userInterfaceStyle == .dark
@@ -1209,10 +1784,7 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
                     // Apply status bar background color via the special view
                     webViewController.setupStatusBarBackground(color: backgroundColor)
 
-                    // Set appropriate background color
-                    if let navController = self.navigationWebViewController {
-                        navController.view.backgroundColor = backgroundColor
-                    }
+                    self.applyBlankToolbarBackground(backgroundColor, to: self.navigationWebViewController)
                 }
 
             }
@@ -1231,9 +1803,15 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
                     return
                 }
             } else if !self.isPresentAfterPageLoad {
-                self.presentView(webViewId: webViewId, isAnimated: isAnimated)
+                guard self.presentView(webViewId: webViewId, isAnimated: isAnimated) else {
+                    return
+                }
             }
             call.resolve(["id": webViewId])
+            // Only clear if this call still owns the slot (overlapping openWebView races).
+            if self.currentPluginCall === call {
+                self.currentPluginCall = nil
+            }
         }
     }
 
@@ -1269,17 +1847,28 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
 
-        guard let url = URL(string: urlString) else {
-            call.reject("Invalid URL")
-            return
-        }
-
         let targetId = call.getString("id")
         guard let webViewController = self.resolveWebViewController(for: targetId) else {
             call.reject("WebView is not initialized")
             return
         }
 
+        if let html = HtmlDataUrlSupport.parseHtml(from: urlString) {
+            webViewController.source = .string(html, base: nil)
+            webViewController.load(string: html, base: nil)
+            call.resolve()
+            return
+        }
+
+        guard let resolution = BundledAssetSupport.resolve(urlString, localURL: self.bridge?.config.localURL),
+              let url = URL(string: resolution.url) else {
+            call.reject("Invalid URL")
+            return
+        }
+
+        self.applyBundledAssetSettings(to: webViewController)
+
+        webViewController.source = .remote(url)
         webViewController.load(remote: url)
         call.resolve()
     }
@@ -1297,48 +1886,60 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
             self.isHidden = hidden
 
             if hidden {
-                if let navController = navigationController, navController.presentingViewController != nil {
-                    navController.view.isHidden = true
-                    navController.view.isUserInteractionEnabled = false
-                    if let containerView = navController.view.superview {
-                        if self.presentationContainerView == nil || self.presentationContainerView !== containerView {
-                            self.presentationContainerView = containerView
-                            self.presentationContainerWasInteractive = containerView.isUserInteractionEnabled
-                            self.presentationContainerPreviousAlpha = containerView.alpha
-                        }
-                        containerView.isUserInteractionEnabled = false
-                        containerView.alpha = 0
-                    }
+                if let resolvedId {
+                    self.detachFramedOverlayWebView(id: resolvedId)
+                    self.detachLayeredWebView(id: resolvedId)
                 }
-
                 if !self.attachWebViewToWindow(webView) {
                     call?.reject("Failed to get active window for hidden webview")
                     return
                 }
+                self.dismissNavigationControllerIfPresented(navigationController)
             } else {
+                webViewController.toolbarHideInProgress = false
                 if webView.superview !== webViewController.view {
                     self.attachWebViewToController(webViewController, webView: webView)
+                }
+
+                if webViewController.isLayeredBehind, let resolvedId {
+                    if self.sendNavigationControllerToBack(id: resolvedId, transparentBackground: webViewController.transparentHostBackground) {
+                        if let navController = navigationController {
+                            self.setActiveWebView(id: resolvedId, webView: webViewController, navigationController: navController)
+                        }
+                        call?.resolve()
+                    } else {
+                        call?.reject("Failed to send webview to back")
+                    }
+                    return
                 }
 
                 if let navController = navigationController {
                     if let resolvedId {
                         self.setActiveWebView(id: resolvedId, webView: webViewController, navigationController: navController)
-                    }
-                    navController.view.isHidden = false
-                    navController.view.isUserInteractionEnabled = true
-                    if let containerView = self.presentationContainerView {
-                        containerView.isUserInteractionEnabled = self.presentationContainerWasInteractive
-                        containerView.alpha = self.presentationContainerPreviousAlpha
-                        self.presentationContainerView = nil
-                        self.presentationContainerWasInteractive = true
-                        self.presentationContainerPreviousAlpha = 1
-                    }
-
-                    if navController.presentingViewController == nil {
+                        if navController.presentingViewController == nil && !self.framedOverlayWebViewIds.contains(resolvedId) {
+                            self.revealNavigationController(
+                                id: resolvedId,
+                                navigationController: navController,
+                                webViewController: webViewController,
+                                animated: true
+                            ) { presented in
+                                if presented {
+                                    call?.resolve()
+                                } else {
+                                    call?.reject("Failed to present webview")
+                                }
+                            }
+                            return
+                        }
+                    } else if navController.presentingViewController == nil {
                         let presenter = self.bridge?.viewController?.presentedViewController ?? self.bridge?.viewController
-                        presenter?.present(navController, animated: true, completion: {
-                            call?.resolve()
-                        })
+                        self.presentNavigationControllerSafely(navController, from: presenter, animated: true) { presented in
+                            if presented {
+                                call?.resolve()
+                            } else {
+                                call?.reject("Failed to present webview")
+                            }
+                        }
                         return
                     }
                 }
@@ -1365,6 +1966,214 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
 
     @objc func show(_ call: CAPPluginCall) {
         self.setHiddenState(false, targetId: call.getString("id"), call: call)
+    }
+
+    @objc func sendToBack(_ call: CAPPluginCall) {
+        DispatchQueue.main.async {
+            let targetId = call.getString("id") ?? self.activeWebViewId
+            guard let resolvedId = targetId,
+                  let webViewController = self.resolveWebViewController(for: resolvedId),
+                  let navigationController = self.resolveNavigationController(for: resolvedId) else {
+                call.reject("WebView is not initialized")
+                return
+            }
+
+            let transparentBackground = call.getBool("transparentBackground", true)
+            self.dismissNavigationControllerIfPresented(navigationController) {
+                webViewController.isLayeredBehind = true
+                webViewController.transparentHostBackground = transparentBackground
+                guard self.sendNavigationControllerToBack(id: resolvedId, transparentBackground: transparentBackground) else {
+                    call.reject("Failed to send webview to back")
+                    return
+                }
+                self.setActiveWebView(id: resolvedId, webView: webViewController, navigationController: navigationController)
+                call.resolve()
+            }
+        }
+    }
+    @objc func bringToFront(_ call: CAPPluginCall) {
+        DispatchQueue.main.async {
+            let isAnimated = call.getBool("isAnimated", true)
+            let targetId = call.getString("id") ?? self.activeWebViewId
+            guard let resolvedId = targetId,
+                  let webViewController = self.resolveWebViewController(for: resolvedId),
+                  let navigationController = self.resolveNavigationController(for: resolvedId) else {
+                call.reject("WebView is not initialized")
+                return
+            }
+
+            webViewController.isLayeredBehind = false
+            webViewController.transparentHostBackground = true
+            self.detachLayeredWebView(id: resolvedId)
+            if let webView = webViewController.capableWebView, webView.superview !== webViewController.view {
+                self.attachWebViewToController(webViewController, webView: webView)
+            }
+            self.setActiveWebView(id: resolvedId, webView: webViewController, navigationController: navigationController)
+            if navigationController.presentingViewController == nil && !self.framedOverlayWebViewIds.contains(resolvedId) {
+                self.revealNavigationController(
+                    id: resolvedId,
+                    navigationController: navigationController,
+                    webViewController: webViewController,
+                    animated: isAnimated
+                ) { presented in
+                    if presented {
+                        call.resolve()
+                    } else {
+                        call.reject("Failed to present webview")
+                    }
+                }
+                return
+            }
+            if webViewController.shouldPresentAsFramedOverlay {
+                guard self.presentNavigationControllerAsFramedOverlay(id: resolvedId) else {
+                    call.reject("Failed to present webview")
+                    return
+                }
+            }
+            call.resolve()
+        }
+    }
+
+    private func jsNumber(_ value: Float?, fallback: String = "0") -> String {
+        guard let value, value.isFinite else {
+            return fallback
+        }
+        return String(Double(value))
+    }
+
+    private func dispatchInputScript(type: String, x positionX: Float?, y positionY: Float?, deltaX: Float?, deltaY: Float?) -> String? {
+        if type == "scroll" {
+            guard let positionX, let positionY, let deltaX, let deltaY,
+                  positionX.isFinite, positionY.isFinite, deltaX.isFinite, deltaY.isFinite else {
+                return nil
+            }
+            let xLiteral = jsNumber(positionX)
+            let yLiteral = jsNumber(positionY)
+            let deltaXLiteral = jsNumber(deltaX)
+            let deltaYLiteral = jsNumber(deltaY)
+            return """
+            (function() {
+              const x = \(xLiteral);
+              const y = \(yLiteral);
+              const dx = \(deltaXLiteral);
+              const dy = \(deltaYLiteral);
+              let target = Number.isFinite(x) && Number.isFinite(y) ? document.elementFromPoint(x, y) : null;
+              while (target && target !== document.body && target !== document.documentElement) {
+                const style = window.getComputedStyle(target);
+                const canScroll = /(auto|scroll)/.test(style.overflow + style.overflowX + style.overflowY) &&
+                  (target.scrollHeight > target.clientHeight || target.scrollWidth > target.clientWidth);
+                if (canScroll && typeof target.scrollBy === 'function') {
+                  target.scrollBy(dx, dy);
+                  return true;
+                }
+                target = target.parentElement;
+              }
+              window.scrollBy(dx, dy);
+              return true;
+            })();
+            """
+        }
+
+        let pointerEvents: [String]
+        let mouseEvents: [String]
+        let touchEvents: [String]
+        switch type {
+        case "click":
+            pointerEvents = ["pointerdown", "pointerup"]
+            mouseEvents = ["mousedown", "mouseup", "click"]
+            touchEvents = ["touchstart", "touchend"]
+        case "touchstart":
+            pointerEvents = ["pointerdown"]
+            mouseEvents = ["mousedown"]
+            touchEvents = ["touchstart"]
+        case "touchmove":
+            pointerEvents = ["pointermove"]
+            mouseEvents = ["mousemove"]
+            touchEvents = ["touchmove"]
+        case "touchend":
+            pointerEvents = ["pointerup"]
+            mouseEvents = ["mouseup"]
+            touchEvents = ["touchend"]
+        case "touchcancel":
+            pointerEvents = ["pointercancel"]
+            mouseEvents = []
+            touchEvents = ["touchcancel"]
+        default:
+            return nil
+        }
+
+        guard let positionX, let positionY, positionX.isFinite, positionY.isFinite else {
+            return nil
+        }
+
+        let pointerEventsData = try? JSONSerialization.data(withJSONObject: pointerEvents)
+        let mouseEventsData = try? JSONSerialization.data(withJSONObject: mouseEvents)
+        let touchEventsData = try? JSONSerialization.data(withJSONObject: touchEvents)
+        let pointerEventsJSON = pointerEventsData.flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        let mouseEventsJSON = mouseEventsData.flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        let touchEventsJSON = touchEventsData.flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+
+        return """
+        (function() {
+          const x = \(jsNumber(positionX));
+          const y = \(jsNumber(positionY));
+          const target = document.elementFromPoint(x, y);
+          if (!target) return false;
+          const base = { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, screenX: x, screenY: y };
+          for (const name of \(pointerEventsJSON)) {
+            if (typeof PointerEvent === 'function') {
+              target.dispatchEvent(new PointerEvent(name, Object.assign({}, base, { pointerId: 1, pointerType: 'touch', isPrimary: true })));
+            }
+          }
+          for (const name of \(mouseEventsJSON)) {
+            target.dispatchEvent(new MouseEvent(name, base));
+          }
+          if (typeof TouchEvent === 'function' && typeof Touch === 'function') {
+            for (const name of \(touchEventsJSON)) {
+              try {
+                const touch = new Touch({ identifier: 1, target: target, clientX: x, clientY: y, screenX: x, screenY: y });
+                const activeTouches = name === 'touchend' || name === 'touchcancel' ? [] : [touch];
+                target.dispatchEvent(new TouchEvent(name, {
+                  bubbles: true,
+                  cancelable: true,
+                  composed: true,
+                  touches: activeTouches,
+                  targetTouches: activeTouches,
+                  changedTouches: [touch]
+                }));
+              } catch (_) {}
+            }
+          }
+          return true;
+        })();
+        """
+    }
+
+    @objc func dispatchInputEvent(_ call: CAPPluginCall) {
+        guard let type = call.getString("type") else {
+            call.reject("Input event type is required")
+            return
+        }
+        guard let script = dispatchInputScript(
+            type: type,
+            x: call.getFloat("x"),
+            y: call.getFloat("y"),
+            deltaX: call.getFloat("deltaX"),
+            deltaY: call.getFloat("deltaY")
+        ) else {
+            call.reject("Unsupported input event type or invalid input payload: \(type)")
+            return
+        }
+
+        DispatchQueue.main.async {
+            let targetId = call.getString("id") ?? self.activeWebViewId
+            guard let webViewController = self.resolveWebViewController(for: targetId) else {
+                call.reject("WebView is not initialized")
+                return
+            }
+            webViewController.executeScript(script: script)
+            call.resolve()
+        }
     }
 
     @objc func executeScript(_ call: CAPPluginCall) {
@@ -1452,6 +2261,19 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
                 }
             }
         }
+    }
+
+    /// Keep PassThroughView clear so custom y-offsets show the host app behind the gap.
+    private func applyBlankToolbarBackground(_ color: UIColor, to navigationController: UINavigationController?) {
+        guard let navigationController else { return }
+
+        if let passThrough = navigationController.view as? PassThroughView {
+            passThrough.backgroundColor = .clear
+            passThrough.framedContentView?.backgroundColor = color
+            return
+        }
+
+        navigationController.view.backgroundColor = color
     }
 
     private func normalizedAuthorizedHosts(from links: [String]) -> [String] {
@@ -1542,12 +2364,6 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
             self.setup()
         }
 
-        let isInspectable = call.getBool("isInspectable", false)
-        let preventDeeplink = call.getBool("preventDeeplink", false)
-        self.isPresentAfterPageLoad = call.getBool("isPresentAfterPageLoad", false)
-
-        self.currentPluginCall = call
-
         guard let urlString = call.getString("url") else {
             call.reject("Must provide a URL to open")
             return
@@ -1558,68 +2374,47 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
 
-        let headers = call.getObject("headers", [:]).mapValues { String(describing: $0 as Any) }
-        let credentials = self.readCredentials(call)
+        if BundledAssetSupport.isLikelyBundledRelativePath(urlString) {
+            call.reject("Bundled assets require openWebView()")
+            return
+        }
+
+        guard let url = URL(string: urlString),
+              let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme) else {
+            call.reject("Must provide a valid http(s) URL to open")
+            return
+        }
 
         DispatchQueue.main.async {
-            guard let url = URL(string: urlString) else {
-                call.reject("Invalid URL format")
+            if self.safariViewController != nil {
+                call.reject("Browser is already open")
                 return
             }
 
-            self.webViewController = WKWebViewController.init(url: url, headers: headers, isInspectable: isInspectable, credentials: credentials, preventDeeplink: preventDeeplink, blankNavigationTab: true, enabledSafeBottomMargin: false, enabledSafeTopMargin: true)
+            let safariVC = SFSafariViewController(url: url)
+            safariVC.delegate = self
+            safariVC.modalPresentationStyle = .fullScreen
 
-            guard let webViewController = self.webViewController else {
-                call.reject("Failed to initialize WebViewController")
+            self.safariViewController = safariVC
+            self.safariOpenedUrl = url.absoluteString
+
+            guard let rootPresenter = self.bridge?.viewController else {
+                self.safariViewController = nil
+                self.safariOpenedUrl = nil
+                call.reject("Unable to present Safari View Controller")
                 return
             }
-
-            if self.bridge?.statusBarVisible == true {
-                let subviews = self.bridge?.webView?.superview?.subviews
-                if let emptyStatusBarIndex = subviews?.firstIndex(where: { $0.subviews.isEmpty }) {
-                    if let emptyStatusBar = subviews?[emptyStatusBarIndex] {
-                        webViewController.capacitorStatusBar = emptyStatusBar
-                        emptyStatusBar.removeFromSuperview()
-                    }
-                }
+            let top = BlankTargetNavigationSupport.topPresenter(from: rootPresenter)
+            guard top.presentedViewController == nil else {
+                self.safariViewController = nil
+                self.safariOpenedUrl = nil
+                call.reject("Unable to present Safari View Controller: another view is already presented")
+                return
             }
-
-            webViewController.source = .remote(url)
-            webViewController.leftNavigationBarItemTypes = [.back, .forward, .reload]
-            webViewController.capBrowserPlugin = self
-            webViewController.hasDynamicTitle = true
-
-            self.navigationWebViewController = UINavigationController.init(rootViewController: webViewController)
-            self.navigationWebViewController?.navigationBar.isTranslucent = false
-
-            // Ensure no lines or borders appear by default
-            self.navigationWebViewController?.navigationBar.setBackgroundImage(UIImage(), for: .default)
-            self.navigationWebViewController?.navigationBar.shadowImage = UIImage()
-            self.navigationWebViewController?.navigationBar.setValue(true, forKey: "hidesShadow")
-
-            // Use system appearance
-            let isDarkMode = UITraitCollection.current.userInterfaceStyle == .dark
-            let backgroundColor = isDarkMode ? UIColor.black : UIColor.white
-            let textColor = isDarkMode ? UIColor.white : UIColor.black
-
-            // Apply colors
-            webViewController.setupStatusBarBackground(color: backgroundColor)
-            webViewController.tintColor = textColor
-            self.navigationWebViewController?.navigationBar.tintColor = textColor
-            self.navigationWebViewController?.navigationBar.titleTextAttributes = [NSAttributedString.Key.foregroundColor: textColor]
-            webViewController.statusBarStyle = isDarkMode ? .lightContent : .darkContent
-            webViewController.updateStatusBarStyle()
-
-            // Always hide toolbar to ensure no bottom bar
-            self.navigationWebViewController?.setToolbarHidden(true, animated: false)
-
-            self.navigationWebViewController?.modalPresentationStyle = .overCurrentContext
-            self.navigationWebViewController?.modalTransitionStyle = .crossDissolve
-
-            if !self.isPresentAfterPageLoad {
-                self.presentView()
+            top.present(safariVC, animated: true) {
+                call.resolve()
             }
-            call.resolve()
         }
     }
 
@@ -1706,7 +2501,9 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
             responseDict = dict
         }
 
-        proxyHandler.handleResponse(requestId: requestId, phase: phase, responseData: responseDict)
+        DispatchQueue.global(qos: .userInitiated).async { [proxyHandler] in
+            proxyHandler.handleResponse(requestId: requestId, phase: phase, responseData: responseDict)
+        }
         call.resolve()
     }
 
@@ -1714,14 +2511,28 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         let isAnimated = call.getBool("isAnimated", true)
 
         DispatchQueue.main.async {
+            if call.getString("id") == nil, let safariViewController = self.safariViewController {
+                let url = self.safariOpenedUrl ?? ""
+                self.safariViewController = nil
+                self.safariOpenedUrl = nil
+                safariViewController.dismiss(animated: isAnimated) {
+                    self.notifyListeners("closeEvent", data: ["url": url])
+                    call.resolve()
+                }
+                return
+            }
+
             let targetId = call.getString("id") ?? self.activeWebViewId
             if let targetId,
                let webViewController = self.webViewControllers[targetId],
                let navigationController = self.navigationControllers[targetId] {
                 let currentUrl = webViewController.url?.absoluteString ?? ""
+                let wasPresented = navigationController.presentingViewController != nil
                 webViewController.cleanupWebView()
                 self.handleWebViewDidClose(id: targetId, url: currentUrl)
-                navigationController.dismiss(animated: isAnimated, completion: nil)
+                if wasPresented {
+                    navigationController.dismiss(animated: isAnimated, completion: nil)
+                }
                 call.resolve()
                 return
             }
@@ -1818,6 +2629,11 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
         let xPos = call.getFloat("x")
         let yPos = call.getFloat("y")
 
+        if width != nil && height == nil {
+            call.reject("Height must be specified when width is provided")
+            return
+        }
+
         DispatchQueue.main.async {
             let targetId = call.getString("id") ?? self.activeWebViewId
             guard let webViewController = self.resolveWebViewController(for: targetId) else {
@@ -1884,6 +2700,11 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
 
+        guard let callbackURLScheme = URL(string: redirectUri)?.scheme else {
+            call.reject("Invalid Redirect URI")
+            return
+        }
+
         // Store the call for later resolution
         self.openSecureWindowCall = call
 
@@ -1891,7 +2712,7 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
 
         // Open the URL in a secure browser window
         DispatchQueue.main.async {
-            let session = ASWebAuthenticationSession(url: url, callbackURLScheme: url.scheme) {
+            let session = ASWebAuthenticationSession(url: url, callbackURLScheme: callbackURLScheme) {
                 callbackURL, error in
 
                 // Clean up the stored call
@@ -1908,7 +2729,7 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
                     return
                 }
 
-                if !callbackURL.absoluteString.hasPrefix(redirectUri) {
+                if !SecureWindowRedirectSupport.matches(callbackURL, redirectUri: redirectUri) {
                     call.reject("Redirect URI does not match, expected " + redirectUri + " but got " + callbackURL.absoluteString)
                     return
                 }
@@ -1925,8 +2746,170 @@ public class InAppBrowserPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 }
 
-extension InAppBrowserPlugin: ASWebAuthenticationPresentationContextProviding {
+@available(*, deprecated, renamed: "CapgoInAppBrowserPlugin")
+public typealias InAppBrowserPlugin = CapgoInAppBrowserPlugin
+
+extension CapgoInAppBrowserPlugin: ASWebAuthenticationPresentationContextProviding {
     public func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
         return self.bridge?.viewController?.view.window ?? ASPresentationAnchor()
     }
 }
+
+extension CapgoInAppBrowserPlugin: SFSafariViewControllerDelegate {
+    public func safariViewControllerDidFinish(_ controller: SFSafariViewController) {
+        guard safariViewController != nil else {
+            return
+        }
+        let url = safariOpenedUrl ?? ""
+        safariViewController = nil
+        safariOpenedUrl = nil
+        notifyListeners("closeEvent", data: ["url": url])
+    }
+
+    public func safariViewController(_ controller: SFSafariViewController, didCompleteInitialLoad didLoadSuccessfully: Bool) {
+        if didLoadSuccessfully {
+            notifyListeners("browserPageLoaded", data: [:])
+        } else {
+            notifyListeners("pageLoadError", data: [:])
+        }
+    }
+}
+
+
+extension CapgoInAppBrowserPlugin {
+    private func targetFrame(for webViewController: WKWebViewController, in hostView: UIView) -> CGRect {
+        // Keep pre-#629 screen-space semantics, then convert into the host's coordinates.
+        return CustomWebViewFrameSupport.frameInHost(
+            width: webViewController.customWidth,
+            height: webViewController.customHeight,
+            x: webViewController.customX,
+            y: webViewController.customY,
+            screenSize: CustomWebViewFrameSupport.screenSize(for: hostView),
+            hostOriginInScreen: CustomWebViewFrameSupport.hostOriginInScreen(for: hostView)
+        ) ?? hostView.bounds
+    }
+
+    @discardableResult
+    private func sendNavigationControllerToBack(id: String, transparentBackground: Bool) -> Bool {
+        guard let navigationController = navigationControllers[id],
+              let webViewController = webViewControllers[id],
+              let hostWebView = self.bridge?.webView else {
+            return false
+        }
+
+        if let webView = webViewController.capableWebView, webView.superview !== webViewController.view {
+            cleanupHiddenWebViewContainer(for: webView)
+            attachWebViewToController(webViewController, webView: webView)
+        }
+
+        dismissActiveKeyboard()
+        detachFramedOverlayWebView(id: id)
+        navigationController.view.removeFromSuperview()
+        if transparentBackground {
+            makeHostWebViewTransparent(for: id)
+        } else {
+            restoreHostWebViewBackgroundIfNeeded(for: id)
+        }
+        navigationController.view.frame = targetFrame(for: webViewController, in: hostWebView)
+        navigationController.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        navigationController.view.isUserInteractionEnabled = false
+        hostWebView.addSubview(navigationController.view)
+        hostWebView.sendSubviewToBack(navigationController.view)
+        navigationController.view.setNeedsLayout()
+        navigationController.view.layoutIfNeeded()
+
+        layeredWebViewIds.insert(id)
+        webViewController.isLayeredBehind = true
+        webViewController.transparentHostBackground = transparentBackground
+        return true
+    }
+
+    private func detachLayeredWebView(id: String) {
+        if let navigationController = navigationControllers[id] {
+            if navigationController.view.superview === self.bridge?.webView {
+                navigationController.view.removeFromSuperview()
+            }
+            navigationController.view.isUserInteractionEnabled = true
+        }
+        layeredWebViewIds.remove(id)
+        restoreHostWebViewBackgroundIfNeeded(for: id)
+    }
+
+    /// Front custom-dimension browsers are child VCs with an exact frame (Android-style).
+    /// Full-screen modal + PassThroughView still leaves UITransitionView eating host taps.
+    @discardableResult
+    private func presentNavigationControllerAsFramedOverlay(id: String) -> Bool {
+        guard let navigationController = navigationControllers[id],
+              let webViewController = webViewControllers[id],
+              let parent = self.bridge?.viewController else {
+            return false
+        }
+
+        dismissNavigationControllerIfPresented(navigationController)
+        detachLayeredWebView(id: id)
+
+        let frame = targetFrame(for: webViewController, in: parent.view)
+
+        if navigationController.parent !== parent {
+            if navigationController.parent != nil {
+                navigationController.willMove(toParent: nil)
+                navigationController.view.removeFromSuperview()
+                navigationController.removeFromParent()
+            }
+            parent.addChild(navigationController)
+            parent.view.addSubview(navigationController.view)
+            navigationController.didMove(toParent: parent)
+        } else if navigationController.view.superview !== parent.view {
+            parent.view.addSubview(navigationController.view)
+        }
+
+        navigationController.view.frame = frame
+        navigationController.view.autoresizingMask = []
+        navigationController.view.clipsToBounds = true
+        navigationController.view.isUserInteractionEnabled = true
+        parent.view.bringSubviewToFront(navigationController.view)
+        navigationController.view.setNeedsLayout()
+        navigationController.view.layoutIfNeeded()
+        webViewController.applyCustomDimensions()
+
+        framedOverlayWebViewIds.insert(id)
+        webViewController.isLayeredBehind = false
+        return true
+    }
+
+    private func detachFramedOverlayWebView(id: String) {
+        guard let navigationController = navigationControllers[id] else {
+            framedOverlayWebViewIds.remove(id)
+            return
+        }
+
+        if navigationController.parent != nil {
+            navigationController.willMove(toParent: nil)
+            navigationController.view.removeFromSuperview()
+            navigationController.removeFromParent()
+        } else if framedOverlayWebViewIds.contains(id) {
+            navigationController.view.removeFromSuperview()
+        }
+
+        framedOverlayWebViewIds.remove(id)
+    }
+
+    private func revealNavigationController(
+        id: String,
+        navigationController: UINavigationController,
+        webViewController: WKWebViewController,
+        animated: Bool,
+        completion: ((Bool) -> Void)? = nil
+    ) {
+        if webViewController.shouldPresentAsFramedOverlay {
+            completion?(presentNavigationControllerAsFramedOverlay(id: id))
+            return
+        }
+
+        detachFramedOverlayWebView(id: id)
+        let presenter = self.bridge?.viewController?.presentedViewController ?? self.bridge?.viewController
+        presentNavigationControllerSafely(navigationController, from: presenter, animated: animated, completion: completion)
+    }
+
+}
+

@@ -1,6 +1,6 @@
 {
-  "name": "@capgo/inappbrowser",
-  "version": "8.6.13",
+  "name": "@capgo/capacitor-inappbrowser",
+  "version": "8.15.2",
   "description": "Capacitor plugin in app browser",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",
@@ -12,7 +12,7 @@
     "dist/",
     "ios/Sources/",
     "Package.swift",
-    "CapgoInappbrowser.podspec"
+    "CapgoCapacitorInappbrowser.podspec"
   ],
   "author": "Martin Donadieu <martin@capgo.app>",
   "license": "MPL-2.0",
@@ -32,10 +32,10 @@
   ],
   "scripts": {
     "verify": "bun run verify:ios && bun run verify:android && bun run verify:web",
-    "verify:ios": "xcodebuild -scheme CapgoInappbrowser -destination generic/platform=iOS",
+    "verify:ios": "bun run build:proxy-bridge && xcodebuild -scheme CapgoCapacitorInappbrowser -destination generic/platform=iOS",
     "verify:android": "cd android && ./gradlew clean build test && cd ..",
     "verify:web": "bun run build && bun run test:web",
-    "test:web": "bun test src/proxy-bridge-support.test.ts",
+    "test:web": "bun test src/proxy-bridge-support.test.ts src/bundled-asset-support.test.ts",
     "test:maestro:android": "./scripts/test-maestro-android.sh",
     "lint": "bun run eslint && bun run prettier -- --check && bun run swiftlint -- lint",
     "fmt": "bun run eslint -- --fix && bun run prettier -- --write && bun run swiftlint -- --fix --format",
@@ -43,7 +43,7 @@
     "prettier": "prettier-pretty-check \"**/*.{css,html,ts,js,java}\" --plugin=prettier-plugin-java",
     "swiftlint": "node-swiftlint",
     "docgen": "docgen --api InAppBrowserPlugin --output-readme README.md --output-json dist/docs.json",
-    "build:proxy-bridge": "esbuild src/proxy-bridge.ts --bundle --outfile=android/src/main/assets/proxy-bridge.js --format=iife --target=es2015",
+    "build:proxy-bridge": "esbuild src/proxy-bridge.ts --bundle --outfile=android/src/main/assets/proxy-bridge.js --format=iife --target=es2015 && mkdir -p ios/Sources/InAppBrowserPlugin/Resources && cp android/src/main/assets/proxy-bridge.js ios/Sources/InAppBrowserPlugin/Resources/proxy-bridge.js",
     "build": "bun run clean && bun run docgen && tsc && rollup -c rollup.config.mjs && bun run build:proxy-bridge",
     "clean": "rimraf ./dist",
     "watch": "tsc --watch",
@@ -53,7 +53,10 @@
     "maestro:test:android": "export MAESTRO_DRIVER_STARTUP_TIMEOUT=300000 MAESTRO_CLI_NO_ANALYTICS=1 && sh ./scripts/prepare-android-maestro-device.sh && sh ./scripts/install-android-apk-with-retry.sh example-app/android/app/build/outputs/apk/debug/app-debug.apk && sh ./scripts/start-android-maestro-app.sh app.capgo.inappbrowser app.capgo.inappbrowser/.MainActivity && $HOME/.maestro/bin/maestro test -e APP_ID=app.capgo.inappbrowser example-app/.maestro/proxy-regression-android.yaml",
     "maestro:test:android:blank-target": "export MAESTRO_DRIVER_STARTUP_TIMEOUT=300000 MAESTRO_CLI_NO_ANALYTICS=1 && sh ./scripts/prepare-android-maestro-device.sh && sh ./scripts/install-android-apk-with-retry.sh example-app/android/app/build/outputs/apk/debug/app-debug.apk && sh ./scripts/start-android-maestro-app.sh app.capgo.inappbrowser app.capgo.inappbrowser/.MainActivity && $HOME/.maestro/bin/maestro test --format junit --output maestro-report.xml --debug-output maestro-artifacts --flatten-debug-output -e APP_ID=app.capgo.inappbrowser example-app/.maestro/blank-target-http-stays-in-webview.yaml",
     "maestro:test:android:keyboard": "export MAESTRO_DRIVER_STARTUP_TIMEOUT=300000 MAESTRO_CLI_NO_ANALYTICS=1 && sh ./scripts/prepare-android-maestro-device.sh && sh ./scripts/install-android-apk-with-retry.sh example-app/android/app/build/outputs/apk/debug/app-debug.apk && sh ./scripts/start-android-maestro-app.sh app.capgo.inappbrowser app.capgo.inappbrowser/.MainActivity && $HOME/.maestro/bin/maestro test -e APP_ID=app.capgo.inappbrowser example-app/.maestro/keyboard-regression-android.yaml",
-    "check:wiring": "node scripts/check-capacitor-plugin-wiring.mjs"
+    "check:wiring": "node scripts/check-capacitor-plugin-wiring.mjs",
+    "example:install": "cd example-app && bun install --frozen-lockfile",
+    "example:build": "bun run build && cd example-app && bun install --frozen-lockfile && bun run build",
+    "changelog:ai": "node scripts/generate-ai-changelog.mjs"
   },
   "devDependencies": {
     "@capacitor/android": "8.1.0",
@@ -65,7 +68,7 @@
     "@ionic/prettier-config": "^4.0.0",
     "@ionic/swiftlint-config": "^2.0.0",
     "@types/node": "^24.10.1",
-    "esbuild": "^0.27.3",
+    "esbuild": "^0.28.0",
     "eslint": "^8.57.1",
     "eslint-plugin-import": "^2.31.0",
     "husky": "^9.1.7",
@@ -86,12 +89,12 @@
   "prettier": "@ionic/prettier-config",
   "swiftlint": {
     "excluded": [
-      "${PWD}/.build",
-      "${PWD}/node_modules",
-      "${PWD}/ios/Pods",
-      "${PWD}/example-app",
-      "${PWD}/ios/Sources/InAppBrowserPlugin/InAppBrowserPlugin.swift",
-      "${PWD}/ios/Sources/InAppBrowserPlugin/WKWebViewController.swift"
+      "**/.build",
+      "**/node_modules",
+      "**/ios/Pods",
+      "**/example-app",
+      "**/ios/Sources/InAppBrowserPlugin/InAppBrowserPlugin.swift",
+      "**/ios/Sources/InAppBrowserPlugin/WKWebViewController.swift"
     ],
     "opt_in_rules": [
       "implicitly_unwrapped_optional",
@@ -110,6 +113,22 @@
       "ignores_comments": true,
       "ignores_interpolated_strings": true,
       "ignores_urls": true
+    },
+    "file_length": {
+      "warning": 3000,
+      "error": 4000
+    },
+    "function_body_length": {
+      "warning": 500,
+      "error": 600
+    },
+    "type_body_length": {
+      "warning": 1500,
+      "error": 2000
+    },
+    "cyclomatic_complexity": {
+      "warning": 80,
+      "error": 100
     }
   },
   "capacitor": {

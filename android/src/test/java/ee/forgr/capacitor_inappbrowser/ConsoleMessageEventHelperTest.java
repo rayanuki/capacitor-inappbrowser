@@ -28,16 +28,18 @@ public class ConsoleMessageEventHelperTest {
     }
 
     @Test
-    public void copyForPopupPreservesConsoleCaptureFlag() {
+    public void copyForPopupPreservesHiddenOptions() {
         Options options = new Options();
         options.setHidden(true);
         options.setHiddenPopupWindow(true);
         options.setCaptureConsoleLogs(true);
+        options.setScreenshotOnHide(true);
 
         Options popupCopy = options.copyForPopup();
 
         assertTrue(popupCopy.isPopupWindowMode());
         assertTrue(popupCopy.isHidden());
         assertTrue(popupCopy.getCaptureConsoleLogs());
+        assertTrue(popupCopy.getScreenshotOnHide());
     }
 }

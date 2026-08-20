@@ -15,10 +15,11 @@ permissions:
 jobs:
   comment:
     runs-on: ubuntu-latest
+    # Keep this job capped at 10 minutes; never raise it unless explicitly asked.
     timeout-minutes: 10
     steps:
       - name: Setup Node.js
-        uses: actions/setup-node@v6.4.0
+        uses: actions/setup-node@v6.5.0
         with:
           node-version: 24.x
       - name: Upsert beta publish comment

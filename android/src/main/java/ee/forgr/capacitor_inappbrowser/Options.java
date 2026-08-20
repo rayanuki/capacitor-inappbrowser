@@ -8,7 +8,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Objects;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.regex.Pattern;
 
@@ -57,7 +57,6 @@ public class Options {
             throws IllegalArgumentException, RuntimeException {
             JSObject buttonNearDone = call.getObject("buttonNearDone");
             if (buttonNearDone == null) {
-                // Return null when "buttonNearDone" isn't configured, else throw an error
                 return null;
             }
 
@@ -66,42 +65,41 @@ public class Options {
                 throw new IllegalArgumentException("buttonNearDone.android is null");
             }
 
+            return generateFromAndroidObject(android, assetManager, "buttonNearDone.android");
+        }
+
+        public static ButtonNearDone generateFromAndroidObject(JSObject android, AssetManager assetManager, String optionName)
+            throws IllegalArgumentException, RuntimeException {
             String iconType = android.getString("iconType", "asset");
             AllIconTypes iconTypeEnum;
 
-            // Validate and process icon type
             if ("asset".equals(iconType)) {
                 iconTypeEnum = AllIconTypes.ASSET;
             } else if ("vector".equals(iconType)) {
                 iconTypeEnum = AllIconTypes.VECTOR;
             } else {
-                throw new IllegalArgumentException("buttonNearDone.android.iconType must be 'asset' or 'vector'");
+                throw new IllegalArgumentException(optionName + ".iconType must be 'asset' or 'vector'");
             }
 
             String icon = android.getString("icon");
             if (icon == null) {
-                throw new IllegalArgumentException("buttonNearDone.android.icon is null");
+                throw new IllegalArgumentException(optionName + ".icon is null");
             }
 
-            // For asset type, verify the file exists
             if (iconTypeEnum == AllIconTypes.ASSET) {
                 InputStream fileInputString = null;
 
                 try {
-                    // Try to find in public folder first
                     try {
                         fileInputString = assetManager.open("public/" + icon);
                     } catch (IOException e) {
-                        // If not in public, try in root assets
                         try {
                             fileInputString = assetManager.open(icon);
                         } catch (IOException e2) {
-                            throw new IllegalArgumentException("buttonNearDone.android.icon cannot be found in the assetManager");
+                            throw new IllegalArgumentException(optionName + ".icon cannot be found in the assetManager", e2);
                         }
                     }
-                    // File exists, do nothing
                 } finally {
-                    // Close the input stream if it was opened
                     if (fileInputString != null) {
                         try {
                             fileInputString.close();
@@ -110,18 +108,14 @@ public class Options {
                         }
                     }
                 }
-            }
-            // For vector type, we don't validate here since resources are checked at runtime
-            else if (iconTypeEnum == AllIconTypes.VECTOR) {
-                // Vector resources will be validated when used
+            } else if (iconTypeEnum == AllIconTypes.VECTOR) {
                 System.out.println("Vector resource will be validated at runtime: " + icon);
             }
 
             Integer width = android.getInteger("width", 24);
             Integer height = android.getInteger("height", 24);
 
-            final ButtonNearDone buttonNearDone1 = new ButtonNearDone(iconTypeEnum, iconType, icon, height, width);
-            return buttonNearDone1;
+            return new ButtonNearDone(iconTypeEnum, iconType, icon, height, width);
         }
 
         public AllIconTypes getIconTypeEnum() {
@@ -151,16 +145,24 @@ public class Options {
     private String CloseModalDescription;
     private String CloseModalCancel;
     private ButtonNearDone buttonNearDone;
+    private String closeAction = "close";
+    private String titleFontFamily;
+    private ButtonNearDone titleIcon;
     private String CloseModalOk;
     private Pattern closeModalURLPattern;
     private String url;
+    private volatile String bundledAssetHost = "localhost";
+    private volatile String bundledAssetScheme = "https";
+    private volatile boolean serveBundledAssets = false;
     private JSObject headers;
+    private String customUserAgent;
     private JSObject credentials;
     private String toolbarType;
     private JSObject shareDisclaimer;
     private String shareSubject;
     private boolean disableGoBackOnNativeApplication;
     private boolean activeNativeNavigationForWebview;
+    private boolean enableReloadGesture = false;
     private boolean isPresentAfterPageLoad;
     private WebViewCallbacks callbacks;
     private PluginCall pluginCall;
@@ -169,7 +171,9 @@ public class Options {
     private String BackgroundColor;
     private boolean ShowArrow;
     private boolean ignoreUntrustedSSLError;
+    private boolean clientCertificatePrompt;
     private String preShowScript;
+    private String preShowScriptInjectionTime = "pageLoad";
     private String toolbarTextColor;
     private Pattern proxyRequestsPattern = null;
     private boolean proxyRequests = false;
@@ -191,11 +195,17 @@ public class Options {
     private Integer x = null;
     private Integer y = null;
     private boolean hidden = false;
+    private boolean toBack = false;
+    private boolean transparentBackground = true;
     private boolean showScreenshotButton = false;
+    private boolean screenshotOnHide = false;
     private boolean allowWebViewJsVisibilityControl = false;
     private boolean allowScreenshotsFromWebPage = false;
     private boolean captureConsoleLogs = false;
     private boolean handleDownloads = false;
+    private boolean persistWebViewData = true;
+    /** Accepted for API parity with iOS; Android cookies are already process-global. */
+    private boolean useSharedDataStore = false;
     private InvisibilityMode invisibilityMode = InvisibilityMode.AWARE;
     private String httpMethod = null;
     private String httpBody = null;
@@ -234,6 +244,22 @@ public class Options {
         this.y = y;
     }
 
+    public boolean isToBack() {
+        return toBack;
+    }
+
+    public void setToBack(boolean toBack) {
+        this.toBack = toBack;
+    }
+
+    public boolean getTransparentBackground() {
+        return transparentBackground;
+    }
+
+    public void setTransparentBackground(boolean transparentBackground) {
+        this.transparentBackground = transparentBackground;
+    }
+
     public int getTextZoom() {
         return textZoom;
     }
@@ -252,6 +278,14 @@ public class Options {
 
     public void setShowScreenshotButton(boolean showScreenshotButton) {
         this.showScreenshotButton = showScreenshotButton;
+    }
+
+    public boolean getScreenshotOnHide() {
+        return screenshotOnHide;
+    }
+
+    public void setScreenshotOnHide(boolean screenshotOnHide) {
+        this.screenshotOnHide = screenshotOnHide;
     }
 
     public boolean getAllowScreenshotsFromWebPage() {
@@ -276,6 +310,22 @@ public class Options {
 
     public void setHandleDownloads(boolean handleDownloads) {
         this.handleDownloads = handleDownloads;
+    }
+
+    public boolean getPersistWebViewData() {
+        return persistWebViewData;
+    }
+
+    public void setPersistWebViewData(boolean persistWebViewData) {
+        this.persistWebViewData = persistWebViewData;
+    }
+
+    public boolean getUseSharedDataStore() {
+        return useSharedDataStore;
+    }
+
+    public void setUseSharedDataStore(boolean useSharedDataStore) {
+        this.useSharedDataStore = useSharedDataStore;
     }
 
     public void setMaterialPicker(boolean materialPicker) {
@@ -390,6 +440,30 @@ public class Options {
         return this.buttonNearDone;
     }
 
+    public String getCloseAction() {
+        return closeAction;
+    }
+
+    public void setCloseAction(String closeAction) {
+        this.closeAction = closeAction;
+    }
+
+    public String getTitleFontFamily() {
+        return titleFontFamily;
+    }
+
+    public void setTitleFontFamily(String titleFontFamily) {
+        this.titleFontFamily = titleFontFamily;
+    }
+
+    public ButtonNearDone getTitleIcon() {
+        return titleIcon;
+    }
+
+    public void setTitleIcon(ButtonNearDone titleIcon) {
+        this.titleIcon = titleIcon;
+    }
+
     public String getCloseModalCancel() {
         return CloseModalCancel;
     }
@@ -422,12 +496,52 @@ public class Options {
         this.url = url;
     }
 
+    public String getBundledAssetHost() {
+        return bundledAssetHost;
+    }
+
+    public void setBundledAssetHost(String bundledAssetHost) {
+        if (bundledAssetHost == null || bundledAssetHost.isBlank()) {
+            this.bundledAssetHost = "localhost";
+            return;
+        }
+        this.bundledAssetHost = bundledAssetHost;
+    }
+
+    public String getBundledAssetScheme() {
+        return bundledAssetScheme;
+    }
+
+    public void setBundledAssetScheme(String bundledAssetScheme) {
+        if (bundledAssetScheme == null || bundledAssetScheme.isBlank()) {
+            this.bundledAssetScheme = "https";
+            return;
+        }
+        this.bundledAssetScheme = bundledAssetScheme.toLowerCase(Locale.ROOT);
+    }
+
+    public boolean getServeBundledAssets() {
+        return serveBundledAssets;
+    }
+
+    public void setServeBundledAssets(boolean serveBundledAssets) {
+        this.serveBundledAssets = serveBundledAssets;
+    }
+
     public JSObject getHeaders() {
         return headers;
     }
 
     public void setHeaders(JSObject headers) {
         this.headers = headers;
+    }
+
+    public String getCustomUserAgent() {
+        return customUserAgent;
+    }
+
+    public void setCustomUserAgent(String customUserAgent) {
+        this.customUserAgent = customUserAgent;
     }
 
     public JSObject getCredentials() {
@@ -478,6 +592,14 @@ public class Options {
 
     public void setActiveNativeNavigationForWebview(boolean activeNativeNavigationForWebview) {
         this.activeNativeNavigationForWebview = activeNativeNavigationForWebview;
+    }
+
+    public boolean getEnableReloadGesture() {
+        return enableReloadGesture;
+    }
+
+    public void setEnableReloadGesture(boolean enableReloadGesture) {
+        this.enableReloadGesture = enableReloadGesture;
     }
 
     public boolean getDisableGoBackOnNativeApplication() {
@@ -552,12 +674,28 @@ public class Options {
         this.ignoreUntrustedSSLError = _ignoreUntrustedSSLError;
     }
 
+    public boolean clientCertificatePrompt() {
+        return clientCertificatePrompt;
+    }
+
+    public void setClientCertificatePrompt(boolean clientCertificatePrompt) {
+        this.clientCertificatePrompt = clientCertificatePrompt;
+    }
+
     public String getPreShowScript() {
         return preShowScript;
     }
 
     public void setPreShowScript(String preLoadScript) {
         this.preShowScript = preLoadScript;
+    }
+
+    public String getPreShowScriptInjectionTime() {
+        return preShowScriptInjectionTime;
+    }
+
+    public void setPreShowScriptInjectionTime(String preShowScriptInjectionTime) {
+        this.preShowScriptInjectionTime = preShowScriptInjectionTime != null ? preShowScriptInjectionTime : "pageLoad";
     }
 
     public boolean getPreventDeeplink() {
@@ -677,21 +815,31 @@ public class Options {
         copy.setCloseModalOk(CloseModalOk);
         copy.setCloseModalURLPattern(closeModalURLPattern);
         copy.setButtonNearDone(buttonNearDone);
+        copy.setCloseAction(closeAction);
+        copy.setTitleFontFamily(titleFontFamily);
+        copy.setTitleIcon(titleIcon);
         copy.setUrl("about:blank");
+        copy.setBundledAssetHost(bundledAssetHost);
+        copy.setBundledAssetScheme(bundledAssetScheme);
+        copy.setServeBundledAssets(serveBundledAssets);
         copy.setHeaders(headers);
+        copy.setCustomUserAgent(customUserAgent);
         copy.setCredentials(credentials);
         copy.setToolbarType(toolbarType);
         copy.setShareDisclaimer(shareDisclaimer);
         copy.setShareSubject(shareSubject);
         copy.setDisableGoBackOnNativeApplication(disableGoBackOnNativeApplication);
         copy.setActiveNativeNavigationForWebview(activeNativeNavigationForWebview);
+        copy.setEnableReloadGesture(enableReloadGesture);
         copy.setPresentAfterPageLoad(false);
         copy.setVisibleTitle(VisibleTitle);
         copy.setToolbarColor(ToolbarColor);
         copy.setBackgroundColor(BackgroundColor);
         copy.setArrow(ShowArrow);
         copy.setIgnoreUntrustedSSLError(ignoreUntrustedSSLError);
+        copy.setClientCertificatePrompt(clientCertificatePrompt);
         copy.setPreShowScript(preShowScript);
+        copy.setPreShowScriptInjectionTime(preShowScriptInjectionTime);
         copy.setToolbarTextColor(toolbarTextColor);
         copy.setProxyRequestsPattern(proxyRequestsPattern);
         copy.setProxyRequests(proxyRequests);
@@ -708,11 +856,16 @@ public class Options {
         copy.setEnableGooglePaySupport(enableGooglePaySupport);
         copy.setBlockedHosts(new ArrayList<>(getBlockedHosts()));
         copy.setWidth(width);
+        copy.setPersistWebViewData(persistWebViewData);
+        copy.setUseSharedDataStore(useSharedDataStore);
         copy.setHeight(height);
+        copy.setToBack(toBack);
+        copy.setTransparentBackground(transparentBackground);
         copy.setX(x);
         copy.setY(y);
         copy.setHidden(hidden || hiddenPopupWindow);
         copy.setShowScreenshotButton(showScreenshotButton);
+        copy.setScreenshotOnHide(screenshotOnHide);
         copy.setAllowWebViewJsVisibilityControl(allowWebViewJsVisibilityControl);
         copy.setAllowScreenshotsFromWebPage(allowScreenshotsFromWebPage);
         copy.setCaptureConsoleLogs(captureConsoleLogs);

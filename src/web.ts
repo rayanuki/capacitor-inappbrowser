@@ -6,7 +6,9 @@ import type {
   OpenOptions,
   GetCookieOptions,
   ClearCookieOptions,
+  BringToFrontOptions,
   DimensionOptions,
+  DispatchInputEventOptions,
   OpenSecureWindowOptions,
   OpenSecureWindowResponse,
   ScreenshotResult,
@@ -19,6 +21,10 @@ export class InAppBrowserWeb extends WebPlugin implements InAppBrowserPlugin {
   }
   clearCache(): Promise<any> {
     console.log('clearCache');
+    return Promise.resolve();
+  }
+  clearAllBrowsingData(): Promise<any> {
+    console.log('clearAllBrowsingData');
     return Promise.resolve();
   }
   async open(options: OpenOptions): Promise<any> {
@@ -58,6 +64,21 @@ export class InAppBrowserWeb extends WebPlugin implements InAppBrowserPlugin {
 
   async show(options?: { id?: string }): Promise<void> {
     console.log('show', options);
+    return;
+  }
+
+  async sendToBack(options?: { id?: string; transparentBackground?: boolean }): Promise<void> {
+    console.log('sendToBack not supported on web', options);
+    return;
+  }
+
+  async bringToFront(options?: BringToFrontOptions): Promise<void> {
+    console.log('bringToFront not supported on web', options);
+    return;
+  }
+
+  async dispatchInputEvent(options: DispatchInputEventOptions): Promise<void> {
+    console.log('dispatchInputEvent not supported on web', options);
     return;
   }
 
