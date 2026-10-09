@@ -1,47 +1,284 @@
+import UIKit
 import XCTest
 @testable import InappbrowserPlugin
 
 final class InAppBrowserPluginTests: XCTestCase {
-    func testConsoleMessagePayloadNormalizesFields() {
-        let payload = ConsoleMessageSupport.normalizePayload(
-            from: [
-                "level": "WARN",
-                "message": "popup blocked",
-                "source": "https://example.com/app.js",
-                "line": NSNumber(value: 42),
-                "column": "7",
-                "kind": "console"
-            ]
+    func testCustomWebViewFrameUsesExplicitDimensions() {
+        XCTAssertEqual(
+            CustomWebViewFrameSupport.resolvedFrame(
+                width: 320,
+                height: 480,
+                x: 12,
+                y: 24,
+                fallbackSize: CGSize(width: 390, height: 844)
+            ),
+            CGRect(x: 12, y: 24, width: 320, height: 480)
         )
-
-        XCTAssertEqual(payload["level"] as? String, "warn")
-        XCTAssertEqual(payload["message"] as? String, "popup blocked")
-        XCTAssertEqual(payload["source"] as? String, "https://example.com/app.js")
-        XCTAssertEqual(payload["line"] as? Int, 42)
-        XCTAssertEqual(payload["column"] as? Int, 7)
-        XCTAssertEqual(payload["kind"] as? String, "console")
     }
 
-    func testConsoleMessagePayloadDefaultsInvalidValues() {
-        let payload = ConsoleMessageSupport.normalizePayload(
-            from: [
-                "level": "unexpected",
-                "message": NSNumber(value: 15)
-            ]
+    func testCustomWebViewFrameUsesFallbackWidthForHeightOnly() {
+        XCTAssertEqual(
+            CustomWebViewFrameSupport.resolvedFrame(
+                width: nil,
+                height: 480,
+                x: nil,
+                y: 32,
+                fallbackSize: CGSize(width: 390, height: 844)
+            ),
+            CGRect(x: 0, y: 32, width: 390, height: 480)
         )
-
-        XCTAssertEqual(payload["level"] as? String, "log")
-        XCTAssertEqual(payload["message"] as? String, "15")
-        XCTAssertNil(payload["source"])
-        XCTAssertNil(payload["line"])
     }
 
-    func testConsoleCaptureScriptContainsExpectedHooks() {
-        let script = ConsoleMessageSupport.captureScriptSource()
+    func testCustomWebViewFrameIgnoresMissingDimensions() {
+        XCTAssertNil(
+            CustomWebViewFrameSupport.resolvedFrame(
+                width: nil,
+                height: nil,
+                x: 12,
+                y: 24,
+                fallbackSize: CGSize(width: 390, height: 844)
+            )
+        )
+    }
 
-        XCTAssertTrue(script.contains("consoleMessageHandler"))
-        XCTAssertTrue(script.contains("unhandledrejection"))
-        XCTAssertTrue(script.contains("console.assert"))
+    func testCustomWebViewFrameIgnoresWidthWithoutHeight() {
+        XCTAssertNil(
+            CustomWebViewFrameSupport.resolvedFrame(
+                width: 320,
+                height: nil,
+                x: 12,
+                y: 24,
+                fallbackSize: CGSize(width: 390, height: 844)
+            )
+        )
+    }
+
+    func testCustomWebViewFrameInHostPreservesScreenSpaceSize() {
+        let frame = CustomWebViewFrameSupport.frameInHost(
+            width: 320,
+            height: 480,
+            x: 12,
+            y: 100,
+            screenSize: CGSize(width: 390, height: 844),
+            hostOriginInScreen: CGPoint(x: 0, y: 47)
+        )
+
+        XCTAssertEqual(frame, CGRect(x: 12, y: 53, width: 320, height: 480))
+    }
+
+    func testCustomWebViewFrameInHostIdentityWhenHostFillsScreen() {
+        let frame = CustomWebViewFrameSupport.frameInHost(
+            width: nil,
+            height: 600,
+            x: 0,
+            y: 80,
+            screenSize: CGSize(width: 390, height: 844),
+            hostOriginInScreen: .zero
+        )
+
+        XCTAssertEqual(frame, CGRect(x: 0, y: 80, width: 390, height: 600))
+    }
+
+    func testApplyCustomDimensionsKeepsExactSizeOnOffsetHost() {
+        let controller = WKWebViewController()
+        controller.customWidth = 320
+        controller.customHeight = 480
+        controller.customX = 12
+        controller.customY = 100
+
+        let navigationController = UINavigationController(rootViewController: controller)
+        navigationController.loadViewIfNeeded()
+        controller.loadViewIfNeeded()
+
+        let host = UIView(frame: CGRect(x: 0, y: 47, width: 390, height: 797))
+        host.addSubview(navigationController.view)
+
+        controller.applyCustomDimensions()
+
+        XCTAssertEqual(navigationController.view.frame, CGRect(x: 12, y: 53, width: 320, height: 480))
+        XCTAssertEqual(navigationController.view.bounds.size, CGSize(width: 320, height: 480))
+        XCTAssertTrue(navigationController.view.clipsToBounds)
+    }
+
+    func testApplyCustomDimensionsUsesScreenFallbackWidthNotHostWidth() {
+        let controller = WKWebViewController()
+        controller.customHeight = 500
+        controller.customY = 64
+
+        let navigationController = UINavigationController(rootViewController: controller)
+        navigationController.loadViewIfNeeded()
+        controller.loadViewIfNeeded()
+
+        // Narrower-than-screen host must not shrink height-only custom width.
+        let host = UIView(frame: CGRect(x: 0, y: 0, width: 300, height: 700))
+        host.addSubview(navigationController.view)
+
+        controller.applyCustomDimensions()
+
+        XCTAssertEqual(navigationController.view.frame.width, UIScreen.main.bounds.width)
+        XCTAssertEqual(navigationController.view.frame.height, 500)
+        XCTAssertEqual(navigationController.view.frame.origin, CGPoint(x: 0, y: 64))
+    }
+
+    func testPassThroughViewKeepsContentOnTargetFrameAfterLayout() {
+        let targetFrame = CGRect(x: 12, y: 24, width: 320, height: 480)
+        let container = PassThroughView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let contentView = UIView(frame: .zero)
+
+        container.addSubview(contentView)
+        container.framedContentView = contentView
+        container.targetFrame = targetFrame
+        container.layoutIfNeeded()
+
+        XCTAssertEqual(contentView.frame, targetFrame)
+
+        container.frame = CGRect(x: 0, y: 0, width: 430, height: 932)
+        container.layoutIfNeeded()
+
+        XCTAssertEqual(contentView.frame, targetFrame)
+    }
+
+    func testPassThroughViewDeclinesHitsOutsideTargetFrame() {
+        let container = PassThroughView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let contentView = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 600))
+        container.addSubview(contentView)
+        container.framedContentView = contentView
+        container.targetFrame = contentView.frame
+
+        let outsideHit = container.hitTest(CGPoint(x: 24, y: 712), with: nil)
+        let insideHit = container.hitTest(CGPoint(x: 24, y: 120), with: nil)
+
+        XCTAssertNil(outsideHit)
+        XCTAssertTrue(insideHit === contentView)
+    }
+
+    func testFramedFrontOverlayRequiresCustomHeightAndFrontLayer() {
+        let controller = WKWebViewController()
+        XCTAssertFalse(controller.shouldPresentAsFramedOverlay)
+
+        controller.customHeight = 600
+        XCTAssertTrue(controller.shouldPresentAsFramedOverlay)
+
+        controller.isLayeredBehind = true
+        XCTAssertFalse(controller.shouldPresentAsFramedOverlay)
+    }
+
+    func testViewportRefreshIgnoresZeroSizeBeforeLayout() {
+        XCTAssertFalse(
+            WebViewViewportLayoutSupport.shouldRefreshViewport(
+                previousSize: nil,
+                currentSize: .zero
+            )
+        )
+    }
+
+    func testViewportRefreshRunsWhenWebViewSizeChanges() {
+        XCTAssertTrue(
+            WebViewViewportLayoutSupport.shouldRefreshViewport(
+                previousSize: CGSize(width: 390, height: 500),
+                currentSize: CGSize(width: 390, height: 844)
+            )
+        )
+    }
+
+    func testViewportRefreshCanBeForcedAfterKeyboardHide() {
+        XCTAssertTrue(
+            WebViewViewportLayoutSupport.shouldRefreshViewport(
+                previousSize: CGSize(width: 390, height: 844),
+                currentSize: CGSize(width: 390, height: 844),
+                force: true
+            )
+        )
+    }
+
+    func testSafeAreaLayoutDisablesAutomaticBottomInsetByDefault() {
+        XCTAssertEqual(
+            WebViewSafeAreaLayoutSupport.contentInsetAdjustmentBehavior(enabledSafeBottomMargin: false),
+            .never
+        )
+        XCTAssertFalse(
+            WebViewSafeAreaLayoutSupport.shouldInsetLayoutMarginsFromSafeArea(enabledSafeBottomMargin: false)
+        )
+    }
+
+    func testSafeAreaLayoutKeepsAutomaticBottomInsetWhenEnabled() {
+        XCTAssertEqual(
+            WebViewSafeAreaLayoutSupport.contentInsetAdjustmentBehavior(enabledSafeBottomMargin: true),
+            .automatic
+        )
+        XCTAssertTrue(
+            WebViewSafeAreaLayoutSupport.shouldInsetLayoutMarginsFromSafeArea(enabledSafeBottomMargin: true)
+        )
+    }
+
+    func testSafeAreaLayoutNegatesBottomInsetWhenDisabled() {
+        XCTAssertEqual(
+            WebViewSafeAreaLayoutSupport.additionalBottomSafeAreaOffset(
+                enabledSafeBottomMargin: false,
+                safeAreaBottomInset: 34
+            ),
+            -34
+        )
+        XCTAssertEqual(
+            WebViewSafeAreaLayoutSupport.cssBottomInset(
+                enabledSafeBottomMargin: false,
+                safeAreaBottomInset: 34
+            ),
+            0
+        )
+    }
+
+    func testSafeAreaLayoutPreservesBottomInsetWhenEnabled() {
+        XCTAssertEqual(
+            WebViewSafeAreaLayoutSupport.additionalBottomSafeAreaOffset(
+                enabledSafeBottomMargin: true,
+                safeAreaBottomInset: 34
+            ),
+            0
+        )
+        XCTAssertEqual(
+            WebViewSafeAreaLayoutSupport.cssBottomInset(
+                enabledSafeBottomMargin: true,
+                safeAreaBottomInset: 34
+            ),
+            34
+        )
+    }
+
+    func testSafeAreaLayoutRecoversRawSystemBottomInset() {
+        XCTAssertEqual(
+            WebViewSafeAreaLayoutSupport.rawSystemBottomInset(
+                effectiveBottomInset: 0,
+                additionalBottomInset: -34
+            ),
+            34
+        )
+        XCTAssertEqual(
+            WebViewSafeAreaLayoutSupport.rawSystemBottomInset(
+                effectiveBottomInset: 10,
+                additionalBottomInset: 4
+            ),
+            6
+        )
+        XCTAssertEqual(
+            WebViewSafeAreaLayoutSupport.rawSystemBottomInset(
+                effectiveBottomInset: 10,
+                additionalBottomInset: 20
+            ),
+            0
+        )
+    }
+
+    func testSafeAreaCssVariablesScriptUsesRoundedPixelValues() {
+        let script = WebViewSafeAreaLayoutSupport.safeAreaCssVariablesScript(
+            top: 59.4,
+            bottom: 0,
+            left: 0,
+            right: 0
+        )
+
+        XCTAssertTrue(script.contains("--safe-area-inset-top','59px'"))
+        XCTAssertTrue(script.contains("--safe-area-inset-bottom','0px'"))
     }
 
     func testLegacyProxyRequestsConfigurationSupportsBooleanValues() {
@@ -348,6 +585,9 @@ final class InAppBrowserPluginTests: XCTestCase {
         XCTAssertEqual(headers["Cache-Control"], "no-cache")
     }
 
+}
+
+final class ProxySchemeTimeoutSupportTests: XCTestCase {
     func testProxySchemeTimeoutResolutionActionPrefersNativeFallbackForOutbound() {
         XCTAssertEqual(
             ProxySchemeRequestSupport.timeoutResolutionAction(

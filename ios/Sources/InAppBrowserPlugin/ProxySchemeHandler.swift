@@ -403,6 +403,7 @@ enum ProxySchemeRequestSupport {
 }
 
 final class PendingProxyTask {
+    let requestId: String
     let schemeTask: WKURLSchemeTask
     var requestContext: NativeRequestContext
     var responseData: NativeResponseData?
@@ -411,17 +412,44 @@ final class PendingProxyTask {
     var redirectRequest: URLRequest?
     var timeoutToken: UUID?
     var canceled = false
+    /// Set true when WebKit calls `webView(_:stop:)` for this task. Once stopped,
+    /// the `WKURLSchemeTask` must never receive `didReceive`/`didFinish`/`didFailWithError`
+    /// again or WebKit raises an uncatchable NSException.
+    var isStopped = false
+    /// Set true the first time a terminal scheme-task call sequence is committed.
+    /// Guarantees at-most-once completion even when multiple async sources
+    /// (URLSession delegate queue, cookie-sync main hop, global timeout, cancel-all)
+    /// race to finish the same request.
+    private var isComplete = false
 
-    init(schemeTask: WKURLSchemeTask, requestContext: NativeRequestContext, phase: String) {
+    init(requestId: String, schemeTask: WKURLSchemeTask, requestContext: NativeRequestContext, phase: String) {
+        self.requestId = requestId
         self.schemeTask = schemeTask
         self.requestContext = requestContext
         self.phase = phase
+    }
+
+    /// Claims the right to issue the single allowed terminal call sequence on the
+    /// scheme task. Returns true exactly once, and only while the task is live
+    /// (not stopped). Callers MUST hold the handler's `taskLock` so the claim is
+    /// atomic with respect to `webView(_:stop:)` marking the task stopped.
+    func beginCompletionIfLive() -> Bool {
+        if isComplete || isStopped { return false }
+        isComplete = true
+        return true
     }
 }
 
 // swiftlint:disable type_body_length
 public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDelegate {
-    weak var plugin: InAppBrowserPlugin?
+    /// HTTP status codes for which URLSession actually triggers
+    /// `urlSession(_:task:willPerformHTTPRedirection:newRequest:completionHandler:)`.
+    /// Scoped narrowly so other 3xx responses (300, 304, 305, 306) flow through the
+    /// dataTask completion handler normally — 304 Not Modified in particular must
+    /// still reach finish() or the scheme task strands.
+    static let redirectStatusCodes: Set<Int> = [301, 302, 303, 307, 308]
+
+    weak var plugin: CapgoInAppBrowserPlugin?
     private var pendingTasks: [String: PendingProxyTask] = [:]
     private var stoppedRequests: [String: UUID] = [:]
     private var timedOutRequests: [String: String] = [:]
@@ -432,16 +460,17 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
     private let legacyProxyRequestURLRegex: NSRegularExpression?
     private let outboundRules: [NativeProxyRule]
     private let inboundRules: [NativeProxyRule]
+    private weak var proxyBridge: ProxyBridge?
 
     private lazy var session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
-
     init(
-        plugin: InAppBrowserPlugin,
+        plugin: CapgoInAppBrowserPlugin,
         webviewId: String,
         legacyProxyRequests: Bool,
         legacyProxyRequestURLRegex: NSRegularExpression?,
         outboundRules: [NativeProxyRule],
-        inboundRules: [NativeProxyRule]
+        inboundRules: [NativeProxyRule],
+        proxyBridge: ProxyBridge? = nil
     ) {
         self.plugin = plugin
         self.webviewId = webviewId
@@ -449,6 +478,7 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
         self.legacyProxyRequestURLRegex = legacyProxyRequestURLRegex
         self.outboundRules = outboundRules
         self.inboundRules = inboundRules
+        self.proxyBridge = proxyBridge
         super.init()
     }
 
@@ -460,7 +490,8 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
             legacyProxyRequests: legacyProxyRequests,
             legacyProxyRequestURLRegex: legacyProxyRequestURLRegex,
             outboundRules: outboundRules,
-            inboundRules: inboundRules
+            inboundRules: inboundRules,
+            proxyBridge: proxyBridge
         )
     }
 
@@ -477,14 +508,11 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
         }
 
         let requestId = UUID().uuidString
-        let requestContext = NativeRequestContext(
-            url: url.absoluteString,
-            method: ProxySchemeRequestSupport.normalizedRequestMethod(urlSchemeTask.request.httpMethod),
-            headers: urlSchemeTask.request.allHTTPHeaderFields ?? [:],
-            base64Body: extractBody(from: urlSchemeTask.request),
-            isMainFrame: ProxySchemeRequestSupport.isMainFrameRequest(urlSchemeTask.request)
-        )
-        let pendingTask = PendingProxyTask(schemeTask: urlSchemeTask, requestContext: requestContext, phase: "outbound")
+        guard let requestContext = makeInitialRequestContext(from: urlSchemeTask, requestURL: url) else {
+            finishCanceledSchemeTask(urlSchemeTask)
+            return
+        }
+        let pendingTask = PendingProxyTask(requestId: requestId, schemeTask: urlSchemeTask, requestContext: requestContext, phase: "outbound")
 
         taskLock.lock()
         pendingTasks[requestId] = pendingTask
@@ -496,6 +524,7 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
     public func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {
         taskLock.lock()
         if let entry = pendingTasks.first(where: { $0.value.schemeTask === urlSchemeTask }) {
+            entry.value.isStopped = true
             pendingTasks.removeValue(forKey: entry.key)
             let cleanupToken = UUID()
             stoppedRequests[entry.key] = cleanupToken
@@ -566,7 +595,6 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
 
         if pendingTask.canceled {
             finishWithCanceledResponse(task: pendingTask)
-            removePendingTask(requestId: requestId)
             return
         }
 
@@ -576,7 +604,6 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
         ) {
         case .finishCachedResponse:
             guard let responseData = pendingTask.responseData else { return }
-            removePendingTask(requestId: requestId)
             syncResponseCookies(from: responseData, fallbackURL: pendingTask.requestContext.url) {
                 self.finish(task: pendingTask, with: responseData)
             }
@@ -593,14 +620,14 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
         do {
             request = try makeURLRequest(from: pendingTask.requestContext)
         } catch {
-            pendingTask.schemeTask.didFailWithError(
-                NSError(
+            failSchemeTask(
+                pendingTask,
+                with: NSError(
                     domain: "ProxySchemeHandler",
                     code: -3,
                     userInfo: [NSLocalizedDescriptionKey: error.localizedDescription]
                 )
             )
-            removePendingTask(requestId: requestId)
             return
         }
         let task = session.dataTask(with: request) { [weak self] data, response, error in
@@ -608,17 +635,41 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
             guard let pendingTask = self.pendingTask(for: requestId) else { return }
 
             if let error {
-                if (error as NSError).code == NSURLErrorCancelled, pendingTask.redirectRequest != nil {
+                if (error as NSError).code == NSURLErrorCancelled {
+                    // The data task is only canceled by webView(_:stop:) or
+                    // cancelAllPendingTasks(), and both own the task's lifecycle: stop has
+                    // already removed it (and marked it stopped) before canceling, while
+                    // cancelAll routes a terminal failSchemeTask through completeSchemeTask,
+                    // which removes it on the main queue. Removing it here on the URLSession
+                    // background queue would unhook it from pendingTasks before a racing
+                    // stop could mark it stopped, reopening the post-stop completion crash.
+                    // So just stop processing and let the owning path complete it.
                     return
                 }
-                if (error as NSError).code != NSURLErrorCancelled {
-                    pendingTask.schemeTask.didFailWithError(error)
-                }
-                self.removePendingTask(requestId: requestId)
+                self.failSchemeTask(pendingTask, with: error)
                 return
             }
 
             let httpResponse = response as? HTTPURLResponse
+            // Actual HTTP redirect status codes are the exclusive responsibility of
+            // urlSession(_:task:willPerformHTTPRedirection:newRequest:completionHandler:).
+            // When that delegate calls completionHandler(nil) to suppress URLSession's
+            // automatic redirect-following, URLSession still surfaces the redirect body
+            // to this completion handler as a normal response. Without this guard, the
+            // willPerformHTTPRedirection path and this completion handler both race to
+            // mutate pendingTask.responseData and call executeInboundDecision; the late-
+            // firing one overwrites the redirect-target state and ends up handing the
+            // empty redirect body to the WKURLSchemeTask via finish(), short-circuiting
+            // the actual redirect-target fetch.
+            //
+            // Scoped narrowly to the codes that actually trigger willPerformHTTPRedirection
+            // (301, 302, 303, 307, 308). Other 3xx — 300, 304 Not Modified, 305, 306 — are
+            // NOT redirects and the delegate doesn't fire for them, so they must flow
+            // through this completion handler normally (a 304 in particular needs the
+            // scheme task to be didFinish()'d with the cached/empty body, not stranded).
+            if let httpResponse, ProxySchemeHandler.redirectStatusCodes.contains(httpResponse.statusCode) {
+                return
+            }
             let responseHeaders = ProxySchemeRequestSupport.normalizedResponseHeaders(from: httpResponse)
             pendingTask.requestContext.url = ProxySchemeRequestSupport.resolvedResponseURL(
                 response,
@@ -654,13 +705,11 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
             switch inboundRule.action {
             case .cancel:
                 finishWithCanceledResponse(task: pendingTask)
-                removePendingTask(requestId: requestId)
             case .continue:
                 if pendingTask.redirectRequest != nil {
                     followPendingRedirect(requestId: requestId)
                 } else {
                     finish(task: pendingTask, with: responseData)
-                    removePendingTask(requestId: requestId)
                 }
             case .delegateToJs:
                 emitProxyEvent(requestId: requestId, pendingTask: pendingTask)
@@ -671,7 +720,6 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
                 followPendingRedirect(requestId: requestId)
             } else {
                 finish(task: pendingTask, with: responseData)
-                removePendingTask(requestId: requestId)
             }
         }
     }
@@ -733,7 +781,6 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
                 self.fallbackToNativePipeline(requestId: requestId)
                 return
             case .finishCachedResponse:
-                self.pendingTasks.removeValue(forKey: requestId)
                 self.taskLock.unlock()
                 guard let responseData else { return }
                 self.syncResponseCookies(from: responseData, fallbackURL: pendingTask.requestContext.url) {
@@ -741,12 +788,12 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
                 }
                 return
             case .failRequest:
-                self.pendingTasks.removeValue(forKey: requestId)
                 self.taskLock.unlock()
             }
 
-            pendingTask.schemeTask.didFailWithError(
-                NSError(
+            self.failSchemeTask(
+                pendingTask,
+                with: NSError(
                     domain: "ProxySchemeHandler",
                     code: NSURLErrorTimedOut,
                     userInfo: [NSLocalizedDescriptionKey: "Proxy handler did not respond within \(Int(self.proxyTimeoutSeconds)) seconds"]
@@ -799,14 +846,6 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
         return task
     }
 
-    private func removePendingTask(requestId: String) {
-        taskLock.lock()
-        pendingTasks.removeValue(forKey: requestId)
-        stoppedRequests.removeValue(forKey: requestId)
-        timedOutRequests.removeValue(forKey: requestId)
-        taskLock.unlock()
-    }
-
     private func routeCurrentRequest(requestId: String) {
         guard let pendingTask = pendingTask(for: requestId) else { return }
         pendingTask.phase = "outbound"
@@ -816,7 +855,6 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
             switch outboundRule.action {
             case .cancel:
                 finishWithCanceledResponse(task: pendingTask)
-                removePendingTask(requestId: requestId)
             case .continue:
                 executeNativePipeline(requestId: requestId)
             case .delegateToJs:
@@ -925,7 +963,18 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
         }
         var request = URLRequest(url: url)
         request.httpMethod = context.method
-        request.allHTTPHeaderFields = context.headers
+        // URLSession will auto-decompress gzip/br/zstd responses only when
+        // Accept-Encoding is NOT present in the request headers (URLSession
+        // adds its own and owns the decompression in that case). If we forward
+        // an Accept-Encoding value supplied by the JS handler (or carried over
+        // by URLSession's own redirect-rewriting), URLSession assumes the
+        // caller will handle decompression and passes the raw compressed bytes
+        // through, which the WKURLSchemeTask then renders as gibberish in the
+        // WebView. Strip it so URLSession's transparent decompression kicks in.
+        let filteredHeaders = context.headers.filter { key, _ in
+            key.caseInsensitiveCompare("Accept-Encoding") != .orderedSame
+        }
+        request.allHTTPHeaderFields = filteredHeaders
         if
             ProxySchemeRequestSupport.supportsRequestBody(method: context.method),
             let bodyData = try ProxySchemeRequestSupport.decodedRequestBody(from: context.base64Body) {
@@ -985,27 +1034,73 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
         )
     }
 
-    private func finish(task: PendingProxyTask, with responseData: NativeResponseData) {
-        guard let url = URL(string: task.requestContext.url),
-              let httpResponse = HTTPURLResponse(
-                url: url,
-                statusCode: responseData.statusCode,
-                httpVersion: "HTTP/1.1",
-                headerFields: responseData.headers
-              )
-        else {
-            task.schemeTask.didFailWithError(
-                NSError(
-                    domain: "ProxySchemeHandler",
-                    code: -2,
-                    userInfo: [NSLocalizedDescriptionKey: "Failed to create response"]
-                )
-            )
-            return
+    /// Runs a terminal `WKURLSchemeTask` call sequence at most once, and never after
+    /// the task has been stopped.
+    ///
+    /// `WKURLSchemeTask` raises an uncatchable NSException if `didReceive`/`didFinish`/
+    /// `didFailWithError` is called after `webView(_:stop:)`, after the task already
+    /// completed, or out of order. Completion can be triggered from several racing
+    /// sources — the URLSession delegate queue, the cookie-sync main-thread hop, the
+    /// global timeout closure, `webView(_:stop:)`, and `cancelAllPendingTasks()`. This
+    /// helper funnels every terminal call onto the main thread (the same queue WebKit
+    /// uses for `start`/`stop`) and gates it behind `beginCompletionIfLive()`, so the
+    /// liveness check and the actual call cannot be separated by a `stop`.
+    ///
+    /// This helper is also the single owner of task removal. Callers MUST NOT remove
+    /// the task from `pendingTasks` eagerly on a background thread before calling a
+    /// terminal method: doing so creates a window where `webView(_:stop:)` (which only
+    /// finds tasks via `pendingTasks`) can no longer mark the task stopped, so a queued
+    /// completion would then call `didReceive`/`didFinish`/`didFailWithError` on an
+    /// already-stopped task and crash. Keeping the task tracked until this main-queue
+    /// block runs lets a racing `stop` win the liveness claim.
+    private func completeSchemeTask(_ task: PendingProxyTask, _ body: @escaping (WKURLSchemeTask) -> Void) {
+        let runBody: () -> Void = { [weak self] in
+            guard let self else { return }
+            self.taskLock.lock()
+            let isLive = task.beginCompletionIfLive()
+            self.pendingTasks.removeValue(forKey: task.requestId)
+            self.stoppedRequests.removeValue(forKey: task.requestId)
+            self.timedOutRequests.removeValue(forKey: task.requestId)
+            self.taskLock.unlock()
+            guard isLive else { return }
+            body(task.schemeTask)
         }
-        task.schemeTask.didReceive(httpResponse)
-        task.schemeTask.didReceive(responseData.body)
-        task.schemeTask.didFinish()
+        if Thread.isMainThread {
+            runBody()
+        } else {
+            DispatchQueue.main.async(execute: runBody)
+        }
+    }
+
+    private func failSchemeTask(_ task: PendingProxyTask, with error: Error) {
+        completeSchemeTask(task) { schemeTask in
+            schemeTask.didFailWithError(error)
+        }
+    }
+
+    private func finish(task: PendingProxyTask, with responseData: NativeResponseData) {
+        completeSchemeTask(task) { schemeTask in
+            guard let url = URL(string: task.requestContext.url),
+                  let httpResponse = HTTPURLResponse(
+                    url: url,
+                    statusCode: responseData.statusCode,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: responseData.headers
+                  )
+            else {
+                schemeTask.didFailWithError(
+                    NSError(
+                        domain: "ProxySchemeHandler",
+                        code: -2,
+                        userInfo: [NSLocalizedDescriptionKey: "Failed to create response"]
+                    )
+                )
+                return
+            }
+            schemeTask.didReceive(httpResponse)
+            schemeTask.didReceive(responseData.body)
+            schemeTask.didFinish()
+        }
     }
 
     private func finishWithCanceledResponse(task: PendingProxyTask) {
@@ -1014,15 +1109,10 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
     }
 
     private func syncResponseCookies(from response: URLResponse?, fallbackURL: String, completion: @escaping () -> Void) {
-        guard
-            let plugin,
-            let cookieStore = plugin.cookieStore(for: webviewId),
-            !fallbackURL.isEmpty
-        else {
+        guard !fallbackURL.isEmpty else {
             completion()
             return
         }
-
         let cookies = ProxySchemeRequestSupport.responseCookies(
             response: response,
             fallback: fallbackURL
@@ -1031,47 +1121,127 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
             completion()
             return
         }
-
-        let group = DispatchGroup()
-        for cookie in cookies {
-            group.enter()
-            cookieStore.setCookie(cookie) {
-                group.leave()
-            }
-        }
-        group.notify(queue: .main) {
-            completion()
-        }
+        writeCookiesOnMain(cookies, completion: completion)
     }
 
     private func syncResponseCookies(from responseData: NativeResponseData, fallbackURL: String, completion: @escaping () -> Void) {
-        guard
-            let plugin,
-            let cookieStore = plugin.cookieStore(for: webviewId),
-            !fallbackURL.isEmpty
-        else {
+        guard !fallbackURL.isEmpty else {
             completion()
             return
         }
-
         let cookies = ProxySchemeRequestSupport.responseCookies(from: responseData.headers, fallback: fallbackURL)
         guard !cookies.isEmpty else {
             completion()
             return
         }
+        writeCookiesOnMain(cookies, completion: completion)
+    }
 
-        let group = DispatchGroup()
-        for cookie in cookies {
-            group.enter()
-            cookieStore.setCookie(cookie) {
-                group.leave()
+    /// Writes cookies into the WebView cookie store on the main thread.
+    ///
+    /// `WKWebsiteDataStore.httpCookieStore` and `WKHTTPCookieStore.setCookie` are both
+    /// `@MainActor`-only on iOS 17+. URLSession delegate callbacks (including
+    /// `urlSession(_:task:willPerformHTTPRedirection:newRequest:)`) and the timeout
+    /// closure dispatched via `DispatchQueue.global().asyncAfter` run on background
+    /// queues, so reaching the cookie store from there triggers Main Thread Checker
+    /// warnings and risks runtime crashes in release builds. Hop to main here so all
+    /// `syncResponseCookies` callers stay correct regardless of their own thread context.
+    private func writeCookiesOnMain(_ cookies: [HTTPCookie], completion: @escaping () -> Void) {
+        DispatchQueue.main.async { [weak self] in
+            guard
+                let self,
+                let plugin = self.plugin,
+                let cookieStore = plugin.cookieStore(for: self.webviewId)
+            else {
+                completion()
+                return
             }
-        }
-        group.notify(queue: .main) {
-            completion()
+            let group = DispatchGroup()
+            for cookie in cookies {
+                group.enter()
+                cookieStore.setCookie(cookie) {
+                    group.leave()
+                }
+            }
+            group.notify(queue: .main) {
+                completion()
+            }
         }
     }
 
+    private func makeInitialRequestContext(from urlSchemeTask: WKURLSchemeTask, requestURL: URL) -> NativeRequestContext? {
+        let requestURLString = requestURL.absoluteString
+
+        if let bridgeRequest = ProxyBridgeSupport.parseBridgeMarkerRequest(requestURLString) {
+            if ProxyBridgeSupport.usesLegacyJsProxyMode(
+                legacyProxyRequests: legacyProxyRequests,
+                legacyProxyRequestURLRegex: legacyProxyRequestURLRegex,
+                hasOutboundRules: !outboundRules.isEmpty,
+                hasInboundRules: !inboundRules.isEmpty
+            ),
+            !ProxyBridgeSupport.shouldDelegateLegacyJsProxyRequest(
+                legacyProxyRequests: legacyProxyRequests,
+                legacyProxyRequestURLRegex: legacyProxyRequestURLRegex,
+                hasOutboundRules: !outboundRules.isEmpty,
+                hasInboundRules: !inboundRules.isEmpty,
+                requestURL: bridgeRequest.originalURL
+            ) {
+                _ = proxyBridge?.getAndRemove(requestId: bridgeRequest.requestId)
+                return nil
+            }
+
+            guard let stored = proxyBridge?.getAndRemove(requestId: bridgeRequest.requestId) else {
+                return nil
+            }
+
+            var headers = ProxyBridgeSupport.decodeStoredHeaders(stored.headersJson)
+            let markerHeaders = urlSchemeTask.request.allHTTPHeaderFields ?? [:]
+            for (key, value) in markerHeaders where headers[key] == nil {
+                headers[key] = value
+            }
+
+            let base64Body = stored.base64Body.isEmpty ? nil : stored.base64Body
+            return NativeRequestContext(
+                url: bridgeRequest.originalURL,
+                method: ProxySchemeRequestSupport.normalizedRequestMethod(stored.method),
+                headers: headers,
+                base64Body: base64Body,
+                isMainFrame: ProxySchemeRequestSupport.isMainFrameRequest(urlSchemeTask.request)
+            )
+        }
+
+        return NativeRequestContext(
+            url: requestURLString,
+            method: ProxySchemeRequestSupport.normalizedRequestMethod(urlSchemeTask.request.httpMethod),
+            headers: urlSchemeTask.request.allHTTPHeaderFields ?? [:],
+            base64Body: extractBody(from: urlSchemeTask.request),
+            isMainFrame: ProxySchemeRequestSupport.isMainFrameRequest(urlSchemeTask.request)
+        )
+    }
+
+    private func finishCanceledSchemeTask(_ schemeTask: WKURLSchemeTask) {
+        guard let url = schemeTask.request.url,
+              let httpResponse = HTTPURLResponse(
+                url: url,
+                statusCode: 204,
+                httpVersion: "HTTP/1.1",
+                headerFields: [:]
+              )
+        else {
+            schemeTask.didFailWithError(
+                NSError(
+                    domain: "ProxySchemeHandler",
+                    code: -4,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to create canceled response"]
+                )
+            )
+            return
+        }
+
+        schemeTask.didReceive(httpResponse)
+        schemeTask.didReceive(Data())
+        schemeTask.didFinish()
+    }
     private func extractBody(from request: URLRequest) -> String? {
         if let body = request.httpBody {
             return body.base64EncodedString()
@@ -1099,15 +1269,19 @@ public class ProxySchemeHandler: NSObject, WKURLSchemeHandler, URLSessionTaskDel
     func cancelAllPendingTasks() {
         taskLock.lock()
         let pending = pendingTasks
-        pendingTasks.removeAll()
+        // Do not clear pendingTasks here. completeSchemeTask removes each task on the
+        // main queue once its failure is claimed, so a concurrent webView(_:stop:) can
+        // still find and mark the task stopped before the queued failure runs. Clearing
+        // eagerly would reopen the post-stop completion crash this fix closes.
         stoppedRequests.removeAll()
         taskLock.unlock()
         session.invalidateAndCancel()
 
         for (_, task) in pending {
             task.urlSessionTask?.cancel()
-            task.schemeTask.didFailWithError(
-                NSError(
+            failSchemeTask(
+                task,
+                with: NSError(
                     domain: "ProxySchemeHandler",
                     code: NSURLErrorCancelled,
                     userInfo: [NSLocalizedDescriptionKey: "WebView closed"]

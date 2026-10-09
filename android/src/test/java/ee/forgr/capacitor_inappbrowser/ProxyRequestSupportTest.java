@@ -19,13 +19,13 @@ import org.junit.Test;
 public class ProxyRequestSupportTest {
 
     @Test
-    public void shouldInjectBridgeWhenRulesEnableNativeProxy() {
+    public void shouldNotInjectBridgeWhenOnlyOutboundInboundRules() {
         Options options = new Options();
         options.setOutboundProxyRules(
             List.of(new NativeProxyRule(null, null, null, null, null, null, null, null, false, NativeProxyRule.Action.DELEGATE_TO_JS))
         );
 
-        assertTrue(ProxyRequestSupport.shouldInjectBridge(options));
+        assertFalse(ProxyRequestSupport.shouldInjectBridge(options));
     }
 
     @Test
@@ -41,6 +41,38 @@ public class ProxyRequestSupportTest {
 
         assertEquals("https://example.com/dashboard", redirectUrl);
         assertNull(ProxyRequestSupport.resolveRedirectUrl("https://example.com/login", 200, Map.of("Location", "/dashboard")));
+    }
+
+    @Test
+    public void supportsWebResourceResponseStatusRejectsAndroidUnsupportedRedirectRange() {
+        assertTrue(ProxyRequestSupport.supportsWebResourceResponseStatus(200));
+        assertTrue(ProxyRequestSupport.supportsWebResourceResponseStatus(404));
+        assertTrue(ProxyRequestSupport.supportsWebResourceResponseStatus(599));
+        assertFalse(ProxyRequestSupport.supportsWebResourceResponseStatus(302));
+        assertFalse(ProxyRequestSupport.supportsWebResourceResponseStatus(304));
+    }
+
+    @Test
+    public void createNativeRequestFailureResponsePayloadMarksSyntheticNetworkErrors() {
+        IOException error = new IOException("Unable to resolve host\nexample.test");
+
+        Map<String, String> headers = ProxyRequestSupport.createNativeRequestFailureHeaders(error);
+        String body = new String(
+            ProxyRequestSupport.createNativeRequestFailureBody("https://example.test/api", error),
+            StandardCharsets.UTF_8
+        );
+
+        assertEquals("Unable to resolve host example.test", headers.get(ProxyRequestSupport.SYNTHETIC_NATIVE_FAILURE_HEADER));
+        assertEquals("no-store", headers.get("Cache-Control"));
+        assertTrue(body.contains("https://example.test/api"));
+        assertTrue(body.contains("Unable to resolve host example.test"));
+    }
+
+    @Test
+    public void shouldFallbackToWebViewOnlyForOriginalUnsupportedStatuses() {
+        assertTrue(ProxyRequestSupport.shouldFallbackToWebViewForUnsupportedStatus(false, 304));
+        assertFalse(ProxyRequestSupport.shouldFallbackToWebViewForUnsupportedStatus(true, 304));
+        assertFalse(ProxyRequestSupport.shouldFallbackToWebViewForUnsupportedStatus(false, 200));
     }
 
     @Test
@@ -141,6 +173,27 @@ public class ProxyRequestSupportTest {
     }
 
     @Test
+    public void stripCacheValidatorHeadersRemovesOnlyRevalidationHeaders() {
+        Map<String, String> headers = ProxyRequestSupport.stripCacheValidatorHeaders(
+            Map.of(
+                "If-None-Match",
+                "\"abc\"",
+                "If-Modified-Since",
+                "Wed, 21 Oct 2015 07:28:00 GMT",
+                "If-Match",
+                "\"write-guard\"",
+                "Accept",
+                "application/json"
+            )
+        );
+
+        assertFalse(headers.containsKey("If-None-Match"));
+        assertFalse(headers.containsKey("If-Modified-Since"));
+        assertEquals("\"write-guard\"", headers.get("If-Match"));
+        assertEquals("application/json", headers.get("Accept"));
+    }
+
+    @Test
     public void resolveOverrideBodyClearsExplicitNullOverride() {
         assertEquals("", ProxyRequestSupport.resolveOverrideBody("aGVsbG8=", "POST", true, null));
     }
@@ -212,6 +265,47 @@ public class ProxyRequestSupportTest {
         );
 
         assertFalse(ProxyRequestSupport.shouldDelegateLegacyJsProxyRequest(options, "https://api.example.com/login"));
+    }
+
+    @Test
+    public void shouldBootstrapInitialProxyLoadForNativeRules() {
+        Options options = new Options();
+        options.setUrl("https://example.com/app");
+        options.setOutboundProxyRules(
+            List.of(new NativeProxyRule(null, null, null, null, null, null, null, null, false, NativeProxyRule.Action.CONTINUE))
+        );
+
+        assertTrue(ProxyRequestSupport.shouldBootstrapInitialProxyLoad(options));
+    }
+
+    @Test
+    public void shouldBootstrapInitialProxyLoadForLegacyRegexMatches() {
+        Options options = new Options();
+        options.setUrl("https://api.example.com/app");
+        options.setProxyRequestsPattern(Pattern.compile("api\\.example\\.com"));
+
+        assertTrue(ProxyRequestSupport.shouldBootstrapInitialProxyLoad(options));
+    }
+
+    @Test
+    public void shouldNotBootstrapInitialProxyLoadWhenLegacyRegexMisses() {
+        Options options = new Options();
+        options.setUrl("https://cdn.example.com/app");
+        options.setProxyRequestsPattern(Pattern.compile("api\\.example\\.com"));
+
+        assertFalse(ProxyRequestSupport.shouldBootstrapInitialProxyLoad(options));
+    }
+
+    @Test
+    public void shouldReturnSyntheticNativeFailureForHandledNonBridgeRequests() {
+        Options options = new Options();
+        options.setOutboundProxyRules(
+            List.of(new NativeProxyRule(null, null, null, null, null, null, null, null, false, NativeProxyRule.Action.CONTINUE))
+        );
+
+        assertTrue(ProxyRequestSupport.shouldReturnSyntheticNativeFailure(false, options, "https://example.com/main"));
+        assertFalse(ProxyRequestSupport.shouldReturnSyntheticNativeFailure(false, new Options(), "https://example.com/main"));
+        assertTrue(ProxyRequestSupport.shouldReturnSyntheticNativeFailure(true, new Options(), "https://example.com/main"));
     }
 
     @Test
@@ -367,6 +461,61 @@ public class ProxyRequestSupportTest {
     }
 
     @Test
+    public void resolveWebResourceResponseConstructorMetadataDefersToExistingContentTypeHeader() {
+        ProxyRequestSupport.WebResourceResponseMetadata metadata = ProxyRequestSupport.resolveWebResourceResponseConstructorMetadata(
+            "multipart/mixed; boundary=fallback",
+            Map.of("content-type", "multipart/mixed; boundary=someboundary")
+        );
+
+        assertNull(metadata.mimeType());
+        assertNull(metadata.encoding());
+
+        ProxyRequestSupport.WebResourceResponseMetadata svgMetadata = ProxyRequestSupport.resolveWebResourceResponseConstructorMetadata(
+            "image/svg+xml",
+            Map.of("Content-Type", "image/svg+xml")
+        );
+
+        assertEquals("image/svg+xml", svgMetadata.mimeType());
+        assertNull(svgMetadata.encoding());
+
+        ProxyRequestSupport.WebResourceResponseMetadata fallbackMetadata =
+            ProxyRequestSupport.resolveWebResourceResponseConstructorMetadata("text/html; charset=utf-8", Map.of());
+
+        assertEquals("text/html", fallbackMetadata.mimeType());
+        assertEquals("utf-8", fallbackMetadata.encoding());
+    }
+
+    @Test
+    public void normalizeProxiedResponseMetadataInfersSvgContentTypeFromRequestUrl() {
+        ProxyRequestSupport.ProxiedResponseMetadata metadata = ProxyRequestSupport.normalizeProxiedResponseMetadata(
+            null,
+            Map.of(),
+            "https://example.com/assets/default-logo.svg"
+        );
+
+        assertEquals("image/svg+xml", metadata.contentType());
+        assertEquals("image/svg+xml", metadata.headers().get("Content-Type"));
+    }
+
+    @Test
+    public void normalizeProxiedResponseMetadataNormalizesGenericSvgXmlContentType() {
+        ProxyRequestSupport.ProxiedResponseMetadata metadata = ProxyRequestSupport.normalizeProxiedResponseMetadata(
+            "text/xml",
+            Map.of("Content-Type", "text/xml"),
+            "https://example.com/assets/default-logo.svg"
+        );
+
+        assertEquals("image/svg+xml", metadata.contentType());
+        assertEquals("text/xml", metadata.headers().get("Content-Type"));
+    }
+
+    @Test
+    public void hasHeaderIgnoreCaseFindsContentTypeWithOriginalCasing() {
+        assertTrue(ProxyRequestSupport.hasHeaderIgnoreCase(Map.of("content-type", "multipart/mixed; boundary=test"), "Content-Type"));
+        assertFalse(ProxyRequestSupport.hasHeaderIgnoreCase(Map.of("Accept", "application/json"), "Content-Type"));
+    }
+
+    @Test
     public void splitResponseHeadersPreservesAllCookieValuesSeparately() {
         ProxyRequestSupport.ParsedResponseHeaders parsedHeaders = ProxyRequestSupport.splitResponseHeaders(
             Map.of(
@@ -420,5 +569,10 @@ public class ProxyRequestSupportTest {
         rawHeaders.put("Content-Type", "text/html");
         rawHeaders.put("Ignored", null);
         assertEquals(Map.of("Content-Type", "text/html"), ProxyRequestSupport.normalizeLegacyStringMap(rawHeaders));
+    }
+
+    @Test
+    public void copyProxyDecisionReturnsNullForNullInput() {
+        assertNull(ProxyRequestSupport.copyProxyDecision(null));
     }
 }

@@ -3,6 +3,7 @@ package ee.forgr.capacitor_inappbrowser;
 import com.getcapacitor.JSObject;
 import java.io.IOException;
 import java.net.URL;
+import java.net.URLConnection;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.HashMap;
@@ -21,6 +22,11 @@ final class ProxyRequestSupport {
     record WebResourceResponseMetadata(String mimeType, String encoding) {}
 
     record ParsedResponseHeaders(Map<String, String> responseHeaders, List<String> cookieHeaders) {}
+
+    record ProxiedResponseMetadata(String contentType, Map<String, String> headers) {}
+
+    static final int SYNTHETIC_NATIVE_FAILURE_STATUS = 599;
+    static final String SYNTHETIC_NATIVE_FAILURE_HEADER = "X-Capgo-Proxy-Error";
 
     private static final String[] SAFE_MARKER_HEADER_NAMES = {
         "Accept",
@@ -44,11 +50,19 @@ final class ProxyRequestSupport {
         "Proxy-Authorization",
         "Referer"
     };
+    /**
+     * Revalidation headers that can make the upstream answer with 304 Not Modified, which
+     * {@link android.webkit.WebResourceResponse#setStatusCodeAndReasonPhrase(int, String)} rejects
+     * (status code must not be in [300, 399]) and crashes the renderer. Scoped intentionally
+     * narrow: {@code If-Match} / {@code If-Unmodified-Since} guard writes (return 412 on mismatch,
+     * not 304) and {@code If-Range} downgrades to a full 200, so they must NOT be stripped here.
+     */
+    private static final String[] CACHE_VALIDATOR_HEADER_NAMES = { "If-None-Match", "If-Modified-Since" };
 
     private ProxyRequestSupport() {}
 
     static boolean shouldInjectBridge(Options options) {
-        return options != null && options.shouldEnableNativeProxy();
+        return usesLegacyJsProxyMode(options);
     }
 
     static boolean usesLegacyJsProxyMode(Options options) {
@@ -96,6 +110,30 @@ final class ProxyRequestSupport {
             return false;
         }
         return !usesLegacyJsProxyMode(options) || matchesProxyRequestsPattern(options.getProxyRequestsPattern(), requestUrl);
+    }
+
+    static boolean shouldBootstrapInitialProxyLoad(Options options) {
+        if (options == null || options.isPopupWindowMode()) {
+            return false;
+        }
+        String initialUrl = options.getUrl();
+        if (initialUrl == null || initialUrl.isBlank()) {
+            return false;
+        }
+        if (HtmlDataUrlSupport.isDataUrl(initialUrl)) {
+            return false;
+        }
+        if (!options.shouldEnableNativeProxy()) {
+            return false;
+        }
+        if (shouldDelegateLegacyJsProxyRequest(options, initialUrl)) {
+            return true;
+        }
+        return shouldHandleNonBridgeRequest(options, initialUrl) && !usesLegacyJsProxyMode(options);
+    }
+
+    static boolean shouldReturnSyntheticNativeFailure(boolean bridgeBackedRequest, Options options, String requestUrl) {
+        return bridgeBackedRequest || shouldHandleNonBridgeRequest(options, requestUrl);
     }
 
     static boolean isBridgeMarkerRequestUrl(String requestUrl) {
@@ -209,6 +247,18 @@ final class ProxyRequestSupport {
         }
     }
 
+    static boolean supportsWebResourceResponseStatus(int statusCode) {
+        return (statusCode >= 100 && statusCode <= 299) || (statusCode >= 400 && statusCode <= 599);
+    }
+
+    static boolean shouldFallbackToWebViewForUnsupportedStatus(boolean bridgeBackedRequest, int statusCode) {
+        return !bridgeBackedRequest && !supportsWebResourceResponseStatus(statusCode);
+    }
+
+    static boolean hasHeaderIgnoreCase(Map<String, String> headers, String expectedKey) {
+        return findHeaderKeyIgnoreCase(headers, expectedKey) != null;
+    }
+
     static String resolveRedirectMethod(String method, int statusCode) {
         String normalizedMethod = normalizeMethod(method);
         if ("HEAD".equals(normalizedMethod)) {
@@ -284,6 +334,23 @@ final class ProxyRequestSupport {
         dropHeaderIgnoreCase(redirectedHeaders, "Content-Type");
         dropHeaderIgnoreCase(redirectedHeaders, "Transfer-Encoding");
         return redirectedHeaders;
+    }
+
+    /**
+     * Returns a copy of {@code headers} with revalidation headers removed
+     * ({@code If-None-Match}, {@code If-Modified-Since}). Used to keep proxied native requests
+     * fresh so the upstream cannot answer with 304, which would crash WebResourceResponse on
+     * Android. Other preconditions ({@code If-Match}, {@code If-Unmodified-Since}, {@code If-Range})
+     * are deliberately preserved because dropping them would change semantics — e.g., turning a
+     * guarded write into an unconditional one.
+     */
+    static Map<String, String> stripCacheValidatorHeaders(Map<String, String> headers) {
+        Map<String, String> copy = new LinkedHashMap<>();
+        if (headers != null) {
+            copy.putAll(headers);
+        }
+        dropHeadersIgnoreCase(copy, CACHE_VALIDATOR_HEADER_NAMES);
+        return copy;
     }
 
     static Map<String, String> prepareOverrideHeaders(Map<String, String> originalHeaders, String requestUrl, String overrideUrl) {
@@ -365,6 +432,164 @@ final class ProxyRequestSupport {
         return new WebResourceResponseMetadata(mimeType, encoding);
     }
 
+    static ProxiedResponseMetadata normalizeProxiedResponseMetadata(
+        String contentType,
+        Map<String, String> responseHeaders,
+        String requestUrl
+    ) {
+        Map<String, String> headers = responseHeaders != null ? new LinkedHashMap<>(responseHeaders) : new LinkedHashMap<>();
+        String headerContentType = findHeaderIgnoreCase(headers, "Content-Type");
+        String resolvedContentType = resolveProxiedContentType(firstNonEmpty(contentType, headerContentType), requestUrl);
+        if (resolvedContentType == null || resolvedContentType.isBlank()) {
+            resolvedContentType = "application/octet-stream";
+        }
+        if (!hasHeaderIgnoreCase(headers, "Content-Type")) {
+            headers.put("Content-Type", resolvedContentType);
+        }
+        return new ProxiedResponseMetadata(resolvedContentType, headers);
+    }
+
+    static WebResourceResponseMetadata resolveWebResourceResponseConstructorMetadata(
+        String contentType,
+        Map<String, String> responseHeaders
+    ) {
+        String headerContentType = findHeaderIgnoreCase(responseHeaders, "Content-Type");
+        if (headerContentType != null && shouldDeferConstructorMimeTypeToContentTypeHeader(headerContentType)) {
+            return new WebResourceResponseMetadata(null, null);
+        }
+        return resolveWebResourceResponseMetadata(contentType, responseHeaders);
+    }
+
+    static String resolveProxiedContentType(String contentType, String requestUrl) {
+        String mimeOnly = extractMimeType(contentType);
+        if (mimeOnly != null && !mimeOnly.isBlank() && !isGenericProxiedMimeType(mimeOnly)) {
+            if (shouldNormalizeSvgContentType(requestUrl, mimeOnly)) {
+                return "image/svg+xml";
+            }
+            return contentType.trim();
+        }
+
+        String guessedContentType = guessContentTypeFromRequestUrl(requestUrl);
+        if (guessedContentType != null) {
+            return guessedContentType;
+        }
+
+        return contentType != null && !contentType.isBlank() ? contentType.trim() : null;
+    }
+
+    static String guessContentTypeFromRequestUrl(String requestUrl) {
+        if (requestUrl == null || requestUrl.isBlank()) {
+            return null;
+        }
+
+        String fileName;
+        try {
+            fileName = new URL(requestUrl).getPath();
+        } catch (Exception error) {
+            return null;
+        }
+        if (fileName == null || fileName.isBlank()) {
+            return null;
+        }
+
+        int slashIndex = fileName.lastIndexOf('/');
+        if (slashIndex >= 0) {
+            fileName = fileName.substring(slashIndex + 1);
+        }
+        if (fileName.isBlank()) {
+            return null;
+        }
+
+        String guessedType = URLConnection.guessContentTypeFromName(fileName);
+        if (guessedType != null && !guessedType.isBlank()) {
+            return guessedType;
+        }
+
+        int dotIndex = fileName.lastIndexOf('.');
+        if (dotIndex < 0 || dotIndex == fileName.length() - 1) {
+            return null;
+        }
+        String extension = fileName.substring(dotIndex + 1).toLowerCase(Locale.US);
+        return switch (extension) {
+            case "svg" -> "image/svg+xml";
+            case "png" -> "image/png";
+            case "jpg", "jpeg" -> "image/jpeg";
+            case "gif" -> "image/gif";
+            case "webp" -> "image/webp";
+            case "pdf" -> "application/pdf";
+            case "json" -> "application/json";
+            case "txt" -> "text/plain";
+            case "csv" -> "text/csv";
+            case "html", "htm" -> "text/html";
+            case "xhtml" -> "application/xhtml+xml";
+            default -> null;
+        };
+    }
+
+    private static boolean shouldNormalizeSvgContentType(String requestUrl, String mimeType) {
+        if (!"svg".equalsIgnoreCase(fileExtensionFromRequestUrl(requestUrl))) {
+            return false;
+        }
+        String normalizedMimeType = mimeType.toLowerCase(Locale.US);
+        return (
+            isGenericProxiedMimeType(normalizedMimeType) ||
+            "text/xml".equals(normalizedMimeType) ||
+            "application/xml".equals(normalizedMimeType)
+        );
+    }
+
+    private static String fileExtensionFromRequestUrl(String requestUrl) {
+        if (requestUrl == null || requestUrl.isBlank()) {
+            return "";
+        }
+        try {
+            String path = new URL(requestUrl).getPath();
+            if (path == null || path.isBlank()) {
+                return "";
+            }
+            int slashIndex = path.lastIndexOf('/');
+            String fileName = slashIndex >= 0 ? path.substring(slashIndex + 1) : path;
+            int dotIndex = fileName.lastIndexOf('.');
+            if (dotIndex < 0 || dotIndex == fileName.length() - 1) {
+                return "";
+            }
+            return fileName.substring(dotIndex + 1);
+        } catch (Exception error) {
+            return "";
+        }
+    }
+
+    private static String extractMimeType(String contentType) {
+        if (contentType == null || contentType.isBlank()) {
+            return null;
+        }
+        String mimeType = contentType.split(";")[0].trim();
+        return mimeType.isEmpty() ? null : mimeType;
+    }
+
+    private static boolean isGenericProxiedMimeType(String mimeType) {
+        if (mimeType == null || mimeType.isBlank()) {
+            return true;
+        }
+        String normalizedMimeType = mimeType.trim().toLowerCase(Locale.US);
+        return (
+            normalizedMimeType.equals("application/octet-stream") ||
+            normalizedMimeType.equals("binary/octet-stream") ||
+            normalizedMimeType.equals("application/download") ||
+            normalizedMimeType.equals("application/x-download") ||
+            normalizedMimeType.equals("application/binary") ||
+            normalizedMimeType.equals("application/x-binary")
+        );
+    }
+
+    private static boolean shouldDeferConstructorMimeTypeToContentTypeHeader(String contentTypeHeader) {
+        String mimeType = extractMimeType(contentTypeHeader);
+        if (mimeType == null) {
+            return false;
+        }
+        return mimeType.toLowerCase(Locale.US).startsWith("multipart/");
+    }
+
     static ParsedResponseHeaders splitResponseHeaders(Map<String, List<String>> rawHeaders) {
         Map<String, String> responseHeaders = new HashMap<>();
         List<String> cookieHeaders = new java.util.ArrayList<>();
@@ -425,6 +650,31 @@ final class ProxyRequestSupport {
         }
 
         return new ParsedResponseHeaders(responseHeaders, cookieHeaders);
+    }
+
+    static String describeNativeRequestFailure(IOException error) {
+        if (error == null || error.getMessage() == null || error.getMessage().isBlank()) {
+            return "Native proxy request failed";
+        }
+        String sanitizedMessage = sanitizeHeaderValue(error.getMessage());
+        return sanitizedMessage.isBlank() ? "Native proxy request failed" : sanitizedMessage;
+    }
+
+    static Map<String, String> createNativeRequestFailureHeaders(IOException error) {
+        Map<String, String> headers = new HashMap<>();
+        headers.put("Cache-Control", "no-store");
+        headers.put("Content-Type", "text/plain; charset=utf-8");
+        headers.put(SYNTHETIC_NATIVE_FAILURE_HEADER, describeNativeRequestFailure(error));
+        return headers;
+    }
+
+    static byte[] createNativeRequestFailureBody(String requestUrl, IOException error) {
+        StringBuilder message = new StringBuilder("Native proxy request failed");
+        if (requestUrl != null && !requestUrl.isBlank()) {
+            message.append(" for ").append(requestUrl);
+        }
+        message.append(": ").append(describeNativeRequestFailure(error));
+        return message.toString().getBytes(StandardCharsets.UTF_8);
     }
 
     static JSObject normalizeLegacySyntheticResponse(JSONObject legacyResponse) {
@@ -525,6 +775,25 @@ final class ProxyRequestSupport {
             return "GET";
         }
         return method.trim().toUpperCase(Locale.US);
+    }
+
+    private static String sanitizeHeaderValue(String value) {
+        StringBuilder sanitizedValue = new StringBuilder(value.length());
+        boolean previousWasSpace = false;
+        for (int index = 0; index < value.length(); index++) {
+            char character = value.charAt(index);
+            boolean shouldReplaceWithSpace = character <= 31 || character == 127;
+            if (shouldReplaceWithSpace) {
+                if (!previousWasSpace) {
+                    sanitizedValue.append(' ');
+                    previousWasSpace = true;
+                }
+                continue;
+            }
+            sanitizedValue.append(character);
+            previousWasSpace = character == ' ';
+        }
+        return sanitizedValue.toString().trim();
     }
 
     private static String normalizeCredentialsMode(String credentialsMode) {
@@ -737,6 +1006,9 @@ final class ProxyRequestSupport {
             return false;
         }
         String normalizedMimeType = mimeType.trim().toLowerCase(Locale.US);
+        if (normalizedMimeType.startsWith("image/")) {
+            return false;
+        }
         return (
             normalizedMimeType.startsWith("text/") ||
             normalizedMimeType.equals("application/json") ||
@@ -771,5 +1043,16 @@ final class ProxyRequestSupport {
             return port;
         }
         return url.getDefaultPort();
+    }
+
+    static JSObject copyProxyDecision(JSObject decision) {
+        if (decision == null) {
+            return null;
+        }
+        try {
+            return JSObject.fromJSONObject(new JSONObject(decision.toString()));
+        } catch (JSONException error) {
+            return null;
+        }
     }
 }

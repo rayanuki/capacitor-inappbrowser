@@ -7,9 +7,17 @@ public interface WebViewCallbacks {
 
     public void closeEvent(String url);
 
+    public void hideEvent(String url, JSObject screenshot);
+
     public void pageLoaded();
 
+    public void pageLoadStart();
+
+    public void pageLoadProgress(double progress);
+
     public void pageLoadError();
+
+    public void customSchemeIntercepted(String url, boolean opened);
 
     public void javascriptCallback(String message);
 

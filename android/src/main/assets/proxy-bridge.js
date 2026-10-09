@@ -31,6 +31,17 @@
     }
     return null;
   }
+  function isNativeProxyErrorResponse(response) {
+    return response.status === 599 && response.headers.get("x-capgo-proxy-error") !== null;
+  }
+  function nativeProxyErrorMessage(response) {
+    const nativeErrorHeader = response.headers.get("x-capgo-proxy-error");
+    if (!nativeErrorHeader) {
+      return "Network request failed";
+    }
+    const nativeMessage = nativeErrorHeader.trim();
+    return nativeMessage || "Network request failed";
+  }
   function replaceCapturedHeader(headers, name, value) {
     const existingKey = findCapturedHeaderKey(headers, name);
     if (existingKey && existingKey !== name) {
@@ -70,7 +81,7 @@
   function resolveProxyBridgeUrl(rawUrl, baseUrl) {
     try {
       return new URL(rawUrl, baseUrl).href;
-    } catch (_error) {
+    } catch (e) {
       return null;
     }
   }
@@ -119,7 +130,7 @@
           form.requestSubmit();
         }
         return;
-      } catch (_error) {
+      } catch (e) {
         delete form.__capgoSkipNextProxySubmit;
       }
     }
@@ -157,7 +168,7 @@
     if (proxyRegexSource) {
       try {
         proxyRequestPattern = new RegExp(proxyRegexSource);
-      } catch (_error) {
+      } catch (e) {
         proxyRequestPattern = null;
       }
     }
@@ -198,7 +209,7 @@
       if (url && !url.match(/^[a-zA-Z][a-zA-Z0-9+\-.]*:\/\//)) {
         try {
           return new URL(url, getDocumentBaseUrl()).href;
-        } catch (_error) {
+        } catch (e) {
           return url;
         }
       }
@@ -278,7 +289,7 @@
       if (submitter instanceof HTMLElement) {
         try {
           return new FormData(form, submitter);
-        } catch (_error) {
+        } catch (e) {
         }
       }
       return new FormData(form);
@@ -439,13 +450,17 @@
         let proxyUrl;
         try {
           proxyUrl = yield storeInterceptedRequest(url, method, headers, body, credentialsMode);
-        } catch (_error) {
+        } catch (e) {
           return originalFetch.call(window, input, init);
         }
-        return originalFetch.call(window, proxyUrl, {
+        const proxyResponse = yield originalFetch.call(globalThis, proxyUrl, {
           method: "GET",
           signal
         });
+        if (isNativeProxyErrorResponse(proxyResponse)) {
+          throw new TypeError(nativeProxyErrorMessage(proxyResponse));
+        }
+        return proxyResponse;
       });
     };
     const originalXhrOpen = XMLHttpRequest.prototype.open;

@@ -12,6 +12,37 @@ export interface UrlEvent {
    */
   url: string;
 }
+
+/** A change to host-controlled fullscreen; independent of HTML/video fullscreen. */
+export interface FullscreenChangeEvent {
+  /** Webview instance id. */
+  id: string;
+  /** Whether fullscreen is currently applied to the visible webview. */
+  enabled: boolean;
+}
+
+/**
+ * Event emitted when the managed webview intercepts a non-standard custom scheme
+ * and hands it to the operating system.
+ *
+ * Standard OS-handled schemes such as `tel:`, `mailto:`, and `sms:` are excluded.
+ *
+ * @since 8.6.7
+ */
+export interface CustomSchemeInterceptedEvent {
+  /**
+   * Webview instance id.
+   */
+  id?: string;
+  /**
+   * Intercepted URL.
+   */
+  url: string;
+  /**
+   * Whether the operating system accepted the URL handoff.
+   */
+  opened: boolean;
+}
 export interface BtnEvent {
   /**
    * Webview instance id.
@@ -25,9 +56,22 @@ export interface BtnEvent {
   url: string;
 }
 
+export interface ButtonNearDoneEvent {
+  /**
+   * Webview instance id.
+   *
+   * @since 8.6.36
+   */
+  id: string;
+}
+
 export type UrlChangeListener = (state: UrlEvent) => void;
 export type ConfirmBtnListener = (state: BtnEvent) => void;
-export type ButtonNearListener = (state: object) => void;
+export type ButtonNearListener = (state: ButtonNearDoneEvent) => void;
+export type CustomSchemeInterceptedListener = (state: CustomSchemeInterceptedEvent) => void;
+
+export type WebViewPointerInputEventType = 'click' | 'touchstart' | 'touchmove' | 'touchend' | 'touchcancel';
+export type WebViewInputEventType = WebViewPointerInputEventType | 'scroll';
 
 export enum BackgroundColor {
   WHITE = 'white',
@@ -67,6 +111,48 @@ export enum InvisibilityMode {
   FAKE_VISIBLE = 'FAKE_VISIBLE',
 }
 
+export enum CloseAction {
+  /**
+   * The toolbar close button closes and destroys the webview.
+   */
+  CLOSE = 'close',
+  /**
+   * The toolbar close button hides the webview so it can be shown again.
+   */
+  HIDE = 'hide',
+}
+
+/**
+ * Web content rendering mode for managed WKWebViews on iOS.
+ *
+ * @since 8.18.0
+ */
+export type PreferredContentMode = 'recommended' | 'mobile' | 'desktop';
+
+export enum CloseButtonPosition {
+  /**
+   * Leading edge of the toolbar (left in left-to-right layouts).
+   */
+  START = 'start',
+  /**
+   * Trailing edge of the toolbar (right in left-to-right layouts).
+   */
+  END = 'end',
+}
+
+export interface ToolbarTitleIconOptions {
+  ios?: {
+    iconType: 'sf-symbol' | 'asset';
+    icon: string;
+  };
+  android?: {
+    iconType: 'asset' | 'vector';
+    icon: string;
+    width?: number;
+    height?: number;
+  };
+}
+
 export interface Headers {
   [key: string]: string;
 }
@@ -89,6 +175,80 @@ export interface Credentials {
   username: string;
   password: string;
 }
+
+export interface LayerOptions {
+  /**
+   * Target webview id. If omitted, targets the active webview.
+   */
+  id?: string;
+  /**
+   * Makes the Capacitor host WebView transparent while this native webview is behind it.
+   *
+   * @default true
+   */
+  transparentBackground?: boolean;
+}
+
+export interface BringToFrontOptions {
+  /**
+   * Target webview id. If omitted, targets the active webview.
+   */
+  id?: string;
+  /**
+   * Whether bringing the webview to the front is animated on iOS.
+   *
+   * @default true
+   */
+  isAnimated?: boolean;
+}
+
+export interface DispatchPointerInputEventOptions {
+  /**
+   * Target webview id. If omitted, targets the active webview.
+   */
+  id?: string;
+  /**
+   * Input event to dispatch to the webview.
+   */
+  type: WebViewPointerInputEventType;
+  /**
+   * X coordinate in CSS pixels from the webview's left edge.
+   */
+  x: number;
+  /**
+   * Y coordinate in CSS pixels from the webview's top edge.
+   */
+  y: number;
+}
+
+export interface DispatchScrollInputEventOptions {
+  /**
+   * Target webview id. If omitted, targets the active webview.
+   */
+  id?: string;
+  /**
+   * Input event to dispatch to the webview.
+   */
+  type: 'scroll';
+  /**
+   * X coordinate in CSS pixels from the webview's left edge.
+   */
+  x: number;
+  /**
+   * Y coordinate in CSS pixels from the webview's top edge.
+   */
+  y: number;
+  /**
+   * Horizontal scroll delta in CSS pixels. Used when `type` is `scroll`.
+   */
+  deltaX: number;
+  /**
+   * Vertical scroll delta in CSS pixels. Used when `type` is `scroll`.
+   */
+  deltaY: number;
+}
+
+export type DispatchInputEventOptions = DispatchPointerInputEventOptions | DispatchScrollInputEventOptions;
 
 /**
  * Represents an intercepted HTTP request from the in-app browser webview.
@@ -204,7 +364,14 @@ export interface ConsoleMessageEvent {
  *
  * @since 8.6.0
  */
-export type DownloadHandledBy = 'inAppBrowser' | 'systemPreview' | 'external';
+export type DownloadHandledBy = 'inAppBrowser' | 'systemPreview' | 'external' | 'wallet';
+
+/**
+ * Where managed downloads are previewed after saving.
+ *
+ * @since 8.19.0
+ */
+export type DownloadPreview = 'inAppBrowser' | 'systemPreview';
 
 /**
  * Event emitted after a managed download is saved locally.
@@ -316,7 +483,12 @@ export type ProxyHandler = (request: ProxyRequest) => ProxyHandlerResult | Promi
 export interface OpenOptions {
   /**
    * Target URL to load.
+   *
+   * Remote `http://` and `https://` URLs are loaded as-is. Relative bundled paths
+   * such as `/index.html` are not supported; use `openWebView()` instead.
+   *
    * @since 0.1.0
+   * @example "https://capgo.app"
    */
   url: string;
   /**
@@ -412,7 +584,7 @@ export interface OpenSecureWindowOptions {
   /**
    * If true, the browser session will be ephemeral (no cookies or browsing data are shared with the system browser).
    * On iOS, this sets `prefersEphemeralWebBrowserSession = true` on `ASWebAuthenticationSession`.
-   * On Android, ephemeral mode is always enabled via `FLAG_ACTIVITY_NO_HISTORY` regardless of this option.
+   * On Android, this enables Custom Tabs ephemeral browsing via `setEphemeralBrowsingEnabled(true)`.
    * @default false
    * @since 6.6.0
    */
@@ -476,6 +648,24 @@ export interface ScreenshotResult {
   height: number;
 }
 
+export interface HideEvent {
+  /**
+   * Webview instance id.
+   */
+  id?: string;
+  /**
+   * URL active when the webview was hidden.
+   */
+  url: string;
+  /**
+   * Screenshot captured immediately before the toolbar close button hides the webview.
+   * Present only when `screenshotOnHide` is enabled and capture succeeds.
+   */
+  screenshot?: ScreenshotResult;
+}
+
+export type HideListener = (state: HideEvent) => void;
+
 export interface CloseWebviewOptions {
   /**
    * Target webview id to close. If omitted, closes the active webview.
@@ -490,9 +680,40 @@ export interface CloseWebviewOptions {
 
 export interface OpenWebViewOptions {
   /**
+   * Present this webview in immersive fullscreen from its first visible frame.
+   * Hides native navigation and system bars and provides a native exit-fullscreen button.
+   * The same webview, page state, cookies, and history are retained on entry and exit.
+   * Exiting restores the configured toolbar and safe-area settings.
+   *
+   * Applies before presentation, including when `isPresentAfterPageLoad` is true.
+   * With `hidden: true`, waits for the first `show()` without changing the host's system bars.
+   * Subsequent hide/show or background/resume cycles do not re-enter fullscreen automatically.
+   * Only supported on iOS and Android for full-size, frontmost `openWebView` presentations.
+   * Custom dimensions and `toBack: true` are unsupported. The Web implementation rejects `true`.
+   * Permission prompts, if needed, are the host application's responsibility.
+   *
+   * @default false
+   * @example
+   * fullscreen: true,
+   * toolbarType: ToolBarType.NAVIGATION // Restored when the user exits fullscreen
+   */
+  fullscreen?: boolean;
+  /**
    * Target URL to load.
+   *
+   * Remote `http://` and `https://` URLs are loaded as-is.
+   *
+   * To open bundled web assets from the app bundle without running a local HTTP server,
+   * pass a relative path such as `/index.html` or `assets/page.html`. The plugin resolves it to
+   * the Capacitor local URL for the current platform (defaults: `capacitor://localhost/...` on iOS,
+   * `https://localhost/...` on Android; actual scheme and host follow the app's configured Capacitor
+   * local URL) and serves files from the packaged `public/` directory, or `www/` on iOS when `public/`
+   * is absent.
+   *
    * @since 0.1.0
+   * @since 8.15.0 Relative bundled paths (`/index.html`, `assets/page.html`) are supported.
    * @example "https://capgo.app"
+   * @example "/index.html"
    */
   url: string;
   /**
@@ -506,6 +727,18 @@ export interface OpenWebViewOptions {
    * Test URL: https://www.whatismybrowser.com/detect/what-http-headers-is-my-browser-sending/
    */
   headers?: Headers;
+  /**
+   * Custom User-Agent string for the webview.
+   *
+   * When set, replaces the system default webview User-Agent on iOS and Android.
+   * Takes precedence over a `User-Agent` entry in `headers`.
+   *
+   * @since 8.13.0
+   * @example
+   * customUserAgent: "MyApp/1.0 (Capacitor)"
+   * Test URL: https://www.whatismybrowser.com/detect/what-is-my-user-agent/
+   */
+  customUserAgent?: string;
   /**
    * Credentials to send with the request and all subsequent requests for the same host.
    * @since 6.1.0
@@ -599,12 +832,81 @@ export interface OpenWebViewOptions {
    */
   captureConsoleLogs?: boolean;
   /**
+   * Controls whether the webview should persist website data such as cache, cookies, local storage,
+   * IndexedDB, and session data.
+   *
+   * When false, iOS uses a non-persistent `WKWebsiteDataStore`. Android disables per-view cache and
+   * database storage where the system WebView supports it while keeping DOM storage available so
+   * SPAs can use `localStorage`. Android cookies use the shared WebView cookie store; clearing them
+   * also affects the host WebView, so prefer per-URL cookie helpers instead of relying on
+   * process-global wipes.
+   *
+   * @default true
+   * @since 8.6.36
+   */
+  persistWebViewData?: boolean;
+  /**
+   * Clear all cookies from the InAppBrowser data store before the first navigation of this webview.
+   *
+   * Cordova `clearcache: 'yes'` parity. On Android, uses process-global `CookieManager.removeAllCookies()`
+   * and starts the first navigation after the wipe callback (does not block the UI thread). On iOS, clears
+   * cookies from the webview's `WKWebsiteDataStore` (isolated plugin store by default). On Web this is a no-op.
+   *
+   * @default false
+   * @since 8.16.0
+   */
+  clearCookiesOnOpen?: boolean;
+  /**
+   * Clear cached website data before the first navigation of this webview.
+   *
+   * Cordova `cleardata: 'yes'` parity. On Android, calls `WebView.clearCache(true)` after the webview
+   * is created. On iOS, removes disk and memory cache from the webview's `WKWebsiteDataStore`.
+   * On Web this is a no-op.
+   *
+   * @default false
+   * @since 8.16.0
+   */
+  clearCacheOnOpen?: boolean;
+  /**
+   * Share the host Capacitor WebView's website data store (cookies, local storage, etc.).
+   *
+   * On iOS 17+, InAppBrowser uses an isolated plugin-owned `WKWebsiteDataStore` by default so host
+   * and browser data stay separate. Set this to `true` to use `WKWebsiteDataStore.default()` instead,
+   * which shares session cookies with the Capacitor host WebView. Useful for SSO / OIDC silent login
+   * when the IdP session was established in the main app WebView.
+   *
+   * Requires `persistWebViewData: true` (the default). When `persistWebViewData` is false, a
+   * non-persistent store is used and this option has no effect.
+   *
+   * On Android this is a no-op: cookies are already process-global via `CookieManager`.
+   * On Web this is a no-op.
+   *
+   * Warning: clearing cookies/cache for a webview opened with this flag can affect the host WebView
+   * on iOS, because both share the same store. `clearAllBrowsingData()` still skips the host store.
+   *
+   * @default false
+   * @since 8.13.6
+   */
+  useSharedDataStore?: boolean;
+  /**
+   * Controls Android TLS client certificate prompts during HTTPS handshakes.
+   * Use `prompt` to show the system certificate picker; omit or use `none` to cancel silently (default).
+   *
+   * @default "none"
+   * @since 8.7.5
+   */
+  clientCertificate?: 'none' | 'prompt';
+  /**
+   * @deprecated Use `clientCertificate: "prompt"` instead.
+   */
+  clientCertificatePrompt?: boolean;
+  /**
    * Automatically handles downloads triggered inside the webview without requiring a custom JavaScript bridge.
    *
    * When enabled:
    * - Standard attachment responses are written to a temporary file.
    * - `blob:` downloads are also captured when the platform supports them.
-   * - Previewable files reopen inside the in-app browser when possible.
+   * - Previewable files reopen inside the in-app browser when possible (see `downloadPreview`).
    * - Other files are handed off to the native preview or viewer flow.
    * - `downloadCompleted` and `downloadFailed` events notify the host app about the saved file.
    *
@@ -612,6 +914,31 @@ export interface OpenWebViewOptions {
    * @since 8.6.0
    */
   handleDownloads?: boolean;
+  /**
+   * Opens managed Apple Wallet pass downloads (`.pkpass`) in the Wallet add-pass sheet
+   * instead of the download preview.
+   *
+   * Falls back to the regular download preview when the device can't add passes. An invalid pass
+   * emits `downloadFailed`. A shown sheet emits `downloadCompleted` with `handledBy: 'wallet'`.
+   *
+   * Requires `handleDownloads: true`. iOS only; ignored on Android.
+   *
+   * @default false
+   * @since 8.21.0
+   */
+  openWalletPasses?: boolean;
+  /**
+   * Controls where managed downloads are previewed after saving.
+   *
+   * - `'inAppBrowser'` (default): Reopens previewable files (PDF, images, text, JSON) inside the same webview.
+   * - `'systemPreview'`: Opens the system Quick Look preview with share and Save to Files actions. iOS only; ignored on Android.
+   *
+   * Requires `handleDownloads: true`.
+   *
+   * @default "inAppBrowser"
+   * @since 8.19.0
+   */
+  downloadPreview?: DownloadPreview;
   /**
    * Share options for the webview. When provided, shows a disclaimer dialog before sharing content.
    * This is useful for:
@@ -661,6 +988,36 @@ export interface OpenWebViewOptions {
    */
   title?: string;
   /**
+   * Native toolbar title font family.
+   * On iOS, use the registered font family name. On Android, the plugin first tries a res/font resource name,
+   * then falls back to a system font family name.
+   *
+   * @since 8.7.7
+   * @example "Inter"
+   */
+  titleFontFamily?: string;
+  /**
+   * Native toolbar title icon displayed before the title text.
+   *
+   * For Android:
+   * - iconType can be "asset" for a bundled SVG asset or "vector" for a drawable resource
+   * - icon path should be in the public folder for assets (e.g. "brand.svg")
+   * - width and height are optional and default to 24dp
+   *
+   * For iOS:
+   * - iconType can be "sf-symbol" or "asset"
+   * - for sf-symbol, icon should be the symbol name
+   * - for asset, icon should be the asset name or bundled web asset path
+   *
+   * @since 8.7.7
+   * @example
+   * titleIcon: {
+   *   ios: { iconType: "sf-symbol", icon: "lock.fill" },
+   *   android: { iconType: "vector", icon: "ic_lock", width: 20, height: 20 }
+   * }
+   */
+  titleIcon?: ToolbarTitleIconOptions;
+  /**
    * Background color of the browser
    * @since 0.1.0
    * @default BackgroundColor.BLACK
@@ -677,6 +1034,34 @@ export interface OpenWebViewOptions {
    * Test URL: https://capgo.app
    */
   activeNativeNavigationForWebview?: boolean;
+
+  /**
+   * Enable pull-to-refresh (overscroll from top) to reload the current page.
+   * - iOS: Uses UIRefreshControl on the WebView scroll view (reload commits on finger release)
+   * - Android: Uses SwipeRefreshLayout around the WebView
+   *
+   * On iOS, this requires overscroll bounce. If `disableOverscroll` is `true`,
+   * the reload gesture will not work.
+   *
+   * @since 8.10.8
+   * @default false
+   * @example
+   * enableReloadGesture: true
+   */
+  enableReloadGesture?: boolean;
+
+  /**
+   * Allow pages to enter HTML5 fullscreen (e.g. `requestFullscreen()` or a video player's fullscreen button).
+   * When `false`, fullscreen requests are rejected and the toolbar stays visible, so the user can always close the browser.
+   *
+   * Android only. On iOS, element fullscreen is not enabled by the plugin, so this option has no effect.
+   *
+   * @since 8.22.0
+   * @default true
+   * @example
+   * allowWebViewFullscreen: false
+   */
+  allowWebViewFullscreen?: boolean;
   /**
    * Disable the possibility to go back on native application,
    * useful to force user to stay on the webview, Android only
@@ -701,6 +1086,27 @@ export interface OpenWebViewOptions {
    */
   isPresentAfterPageLoad?: boolean;
   /**
+   * Web content rendering mode for the managed WKWebView.
+   *
+   * Controls whether pages load with mobile or desktop layout on iPad.
+   * Matches Capacitor's `ios.preferredContentMode` behavior.
+   *
+   * Resolution order when opening a webview:
+   * 1. This per-open value
+   * 2. Plugin config `plugins.CapgoInAppBrowser.preferredContentMode`
+   * 3. Legacy plugin config `plugins.InAppBrowser.preferredContentMode`
+   * 4. Capacitor config `ios.preferredContentMode`
+   *
+   * When unset at all levels, the system default applies (device-recommended).
+   *
+   * **iOS only** — ignored on Android and Web.
+   *
+   * @since 8.18.0
+   * @example
+   * preferredContentMode: "mobile"
+   */
+  preferredContentMode?: PreferredContentMode;
+  /**
    * Whether the website in the webview is inspectable or not, ios only
    * @default false
    */
@@ -719,6 +1125,44 @@ export interface OpenWebViewOptions {
    * Test URL: https://capgo.app
    */
   showReloadButton?: boolean;
+  /**
+   * closeAction controls what happens when the native toolbar close button is pressed.
+   * This does not change the behavior of close(), JavaScript window.mobileApp.close(), or native back navigation.
+   *
+   * @default CloseAction.CLOSE
+   * @since 8.7.7
+   * @example
+   * closeAction: CloseAction.HIDE
+   */
+  closeAction?: CloseAction;
+  /**
+   * Where the native toolbar close button is placed.
+   *
+   * When omitted, each platform keeps its convention: Android places the close button at the
+   * start, iOS at the end (or at the start when `showArrow` is true). Setting this option
+   * overrides that placement on both platforms.
+   *
+   * @since 8.17.0
+   * @example
+   * closeButtonPosition: CloseButtonPosition.END
+   */
+  closeButtonPosition?: CloseButtonPosition;
+  /**
+   * Captures the visible webview and includes it as `screenshot` in `hideEvent`
+   * before the toolbar close button hides the webview.
+   *
+   * Only applies when `closeAction` is `CloseAction.HIDE`.
+   *
+   * On iOS, capture uses `WKWebView.takeSnapshot`. When testing through Apple's
+   * iPhone Mirroring app with the physical device locked, the snapshot can succeed
+   * with the correct dimensions but a fully transparent PNG. Capture works as
+   * expected on a normal unlocked device. This appears to be an Apple mirroring
+   * limitation rather than a plugin bug.
+   *
+   * @default false
+   * @since 8.7.10
+   */
+  screenshotOnHide?: boolean;
   /**
    * CloseModal: if true a confirm will be displayed when user clicks on close button, if false the browser will be closed immediately.
    * @since 1.1.0
@@ -922,7 +1366,11 @@ export interface OpenWebViewOptions {
    */
   enableZoom?: boolean;
   /**
-   * preventDeeplink: if true, the deeplink will not be opened, if false the deeplink will be opened when clicked on the link. on IOS each schema need to be added to info.plist file under LSApplicationQueriesSchemes when false to make it work.
+   * If true, deeplinks and external app hand-off are blocked and stay in the webview.
+   * If false (default), custom schemes such as `tel:`, `mailto:`, and `sms:` open natively.
+   * On iOS, listing a custom scheme under `LSApplicationQueriesSchemes` is only required when
+   * you rely on `canOpenURL` for that scheme (for example `instagram://`). It is not required
+   * for HTTPS `authorizedAppLinks`, and `mailto`/`tel`/`sms` open without that Info.plist entry.
    * @since 0.1.0
    * @default false
    * @example
@@ -946,16 +1394,19 @@ export interface OpenWebViewOptions {
   /**
    * List of base URLs whose hosts are treated as authorized App Links (Android) and Universal Links (iOS).
    *
-   * - On both platforms, only HTTPS links whose host matches any entry in this list
-   *   will attempt to open via the corresponding native application.
-   * - If the app is not installed or the system cannot handle the link, the URL
-   *   will continue loading inside the in-app browser.
+   * - On both platforms, only HTTP(S) links whose host matches any entry in this list
+   *   will attempt to leave the in-app browser for the native / system handler.
+   * - iOS tries a Universal Link first (`universalLinksOnly`), then falls back to a normal
+   *   system open (App Store, Safari, etc.). Only if both fail does the URL stay in-webview.
+   * - Android uses an `ACTION_VIEW` intent for matching hosts.
    * - Matching is host-based (case-insensitive), ignoring the "www." prefix.
+   * - HTTPS hosts do not need `LSApplicationQueriesSchemes`; that Info.plist key is for
+   *   custom schemes like `instagram://`, not `https://instagram.com`.
    * - When `preventDeeplink` is enabled, all external handling is blocked regardless of this list.
    *
    * @example
    * ```ts
-   * ["https://example.com", "https://subdomain.app.io"]
+   * ["https://example.com", "https://instagram.com", "https://apps.apple.com"]
    * ```
    *
    * @since 7.12.0
@@ -964,8 +1415,11 @@ export interface OpenWebViewOptions {
   authorizedAppLinks?: string[];
 
   /**
-   * If true, the webView will not take the full height and will have a 20px margin at the bottom.
-   * This creates a safe margin area outside the browser view.
+   * If true, the webView is inset by the bottom system bar (navigation bar) so bottom-anchored
+   * content stays reachable. When false (default), the webView can extend behind the navigation bar
+   * and apps can use `env(safe-area-inset-*)` for layout, matching the main Capacitor WebView.
+   * On pre-API 30 devices with a transparent navigation bar, bottom padding may still be applied
+   * when the window lays out behind the navigation bar regardless of this option.
    * @since 7.13.0
    * @default false
    * @example
@@ -977,6 +1431,8 @@ export interface OpenWebViewOptions {
    * If false, the webView will extend behind the status bar for true full-screen immersive content.
    * When true (default), respects the safe area at the top of the screen.
    * Works independently of toolbarType - use for full-screen video players, games, or immersive web apps.
+   * On Android, when a toolbar is visible the toolbar itself provides that safe area; with
+   * `toolbarType: 'blank'` on Android 15+ the status bar inset is applied to the webView instead.
    * @since 8.2.0
    * @default true
    * @example
@@ -985,8 +1441,10 @@ export interface OpenWebViewOptions {
   enabledSafeTopMargin?: boolean;
 
   /**
-   * When true, applies the system status bar inset as the WebView top margin on Android.
-   * Keeps the legacy 0px margin by default for apps that handle padding themselves.
+   * When true, applies the system status bar inset to the top of the WebView on Android even when
+   * the window is not edge-to-edge (before Android 15). Keeps the legacy 0px inset by default for
+   * apps that handle padding themselves. On Android 15+ this is not needed: without a visible
+   * toolbar the status bar inset already follows `enabledSafeTopMargin`.
    * @default false
    * @example
    * useTopInset: true
@@ -1039,7 +1497,7 @@ export interface OpenWebViewOptions {
   blockedHosts?: string[];
 
   /**
-   * Width of the webview in pixels.
+   * Width of the webview in screen/window points.
    * If not set, webview will be fullscreen width.
    * @default undefined (fullscreen)
    * @example
@@ -1048,8 +1506,8 @@ export interface OpenWebViewOptions {
   width?: number;
 
   /**
-   * Height of the webview in pixels.
-   * If not set, webview will be fullscreen height.
+   * Height of the webview in screen/window points.
+   * Required for custom-sized (non-fullscreen) webviews.
    * @default undefined (fullscreen)
    * @example
    * height: 600
@@ -1057,8 +1515,8 @@ export interface OpenWebViewOptions {
   height?: number;
 
   /**
-   * X position of the webview in pixels from the left edge.
-   * Only effective when width is set.
+   * X position of the webview in screen/window points from the left edge.
+   * Only effective when custom height is set.
    * @default 0
    * @example
    * x: 50
@@ -1066,13 +1524,29 @@ export interface OpenWebViewOptions {
   x?: number;
 
   /**
-   * Y position of the webview in pixels from the top edge.
-   * Only effective when height is set.
+   * Y position of the webview in screen/window points from the top edge.
+   * Only effective when custom height is set.
    * @default 0
    * @example
    * y: 100
    */
   y?: number;
+
+  /**
+   * Places the native browser behind the Capacitor host WebView.
+   * Make the app background transparent to reveal it, or rely on `transparentBackground` to clear the host WebView.
+   *
+   * @default false
+   */
+  toBack?: boolean;
+
+  /**
+   * When `toBack` is true, makes the Capacitor host WebView transparent so the native browser can be seen behind Ionic content.
+   * Ignored when the browser is in front.
+   *
+   * @default true
+   */
+  transparentBackground?: boolean;
 
   /**
    * Disables the bounce (overscroll) effect on iOS WebView.
@@ -1175,6 +1649,22 @@ export interface InAppBrowserPlugin {
   clearCache(options?: { id?: string }): Promise<any>;
 
   /**
+   * Clear all browsing data from InAppBrowser-managed webviews and the plugin-owned data store.
+   *
+   * This removes cookies, disk cache, memory cache, local storage, session storage, IndexedDB,
+   * WebSQL where supported, form data, and HTTP auth data for InAppBrowser only.
+   *
+   * It does **not** clear the Capacitor/Ionic host WebView stores. On iOS 17+, InAppBrowser uses a
+   * dedicated persistent `WKWebsiteDataStore` so host and browser data stay isolated (unless
+   * `useSharedDataStore: true` was set on `openWebView`). On Android, process-global `CookieManager`
+   * / `WebStorage` are shared with the host WebView and are not wiped by this method; open managed
+   * WebViews still clear per-view cache/history and page storage.
+   *
+   * @since 8.6.36
+   */
+  clearAllBrowsingData(): Promise<any>;
+
+  /**
    * Get cookies for a specific URL.
    * @param options The options, including the URL to get cookies for.
    * @returns A promise that resolves with the cookies.
@@ -1200,6 +1690,22 @@ export interface InAppBrowserPlugin {
    * @since 8.0.8
    */
   show(options?: { id?: string }): Promise<void>;
+  /**
+   * Moves the native browser behind the Capacitor host WebView.
+   * Use `dispatchInputEvent()` to forward overlay gestures to the browser while it is behind the app UI.
+   */
+  sendToBack(options?: LayerOptions): Promise<void>;
+  /**
+   * Moves a browser that was behind the host WebView back to the front.
+   * On iOS, set `isAnimated` to `false` to skip the presentation animation.
+   * When `id` is omitted, targets the active webview.
+   */
+  bringToFront(options?: BringToFrontOptions): Promise<void>;
+  /**
+   * Dispatches a click, touch, or scroll event to a managed browser.
+   * Coordinates are relative to the browser viewport in CSS pixels.
+   */
+  dispatchInputEvent(options: DispatchInputEventOptions): Promise<void>;
   /**
    * Open url in a new webview with toolbars, and enhanced capabilities, like camera access, file access, listen events, inject javascript, bi directional communication, etc.
    *
@@ -1231,6 +1737,10 @@ export interface InAppBrowserPlugin {
   /**
    * Captures the current webview viewport as a PNG screenshot.
    * When `id` is omitted, targets the active webview.
+   *
+   * On iOS, when testing through Apple's iPhone Mirroring app with the physical
+   * device locked, the snapshot can succeed with the correct dimensions but a
+   * fully transparent PNG. Capture works as expected on a normal unlocked device.
    */
   takeScreenshot(options?: { id?: string }): Promise<ScreenshotResult>;
   /**
@@ -1245,6 +1755,24 @@ export interface InAppBrowserPlugin {
    */
   addListener(eventName: 'urlChangeEvent', listenerFunc: UrlChangeListener): Promise<PluginListenerHandle>;
 
+  /**
+   * Listen for applied fullscreen changes, including startup entry, the native exit button,
+   * Android Back, and native lifecycle cleanup. Register before opening to observe startup entry.
+   * Repeated requests for the current state do not emit duplicate events.
+   * This event describes host-controlled fullscreen, not HTML/video fullscreen.
+   */
+  addListener(
+    eventName: 'fullscreenChange',
+    listenerFunc: (event: FullscreenChangeEvent) => void,
+  ): Promise<PluginListenerHandle>;
+
+  /**
+   * Listen for buttonNearDone clicks.
+   *
+   * The event payload contains the webview `id`.
+   *
+   * @since 0.0.1
+   */
   addListener(eventName: 'buttonNearDoneClick', listenerFunc: ButtonNearListener): Promise<PluginListenerHandle>;
 
   /**
@@ -1253,6 +1781,12 @@ export interface InAppBrowserPlugin {
    * @since 0.4.0
    */
   addListener(eventName: 'closeEvent', listenerFunc: UrlChangeListener): Promise<PluginListenerHandle>;
+  /**
+   * Listen for webviews hidden by the toolbar close button when closeAction is CloseAction.HIDE.
+   *
+   * @since 8.7.7
+   */
+  addListener(eventName: 'hideEvent', listenerFunc: HideListener): Promise<PluginListenerHandle>;
   /**
    * Will be triggered when user clicks on confirm button when disclaimer is required,
    * works with openWebView shareDisclaimer and closeModal
@@ -1290,11 +1824,44 @@ export interface InAppBrowserPlugin {
   ): Promise<PluginListenerHandle>;
 
   /**
+   * Will be triggered when a main-frame page load starts (link navigation, reload, etc.).
+   *
+   * @since 8.11.0
+   */
+  addListener(
+    eventName: 'browserPageLoadStart',
+    listenerFunc: (event: { id?: string }) => void,
+  ): Promise<PluginListenerHandle>;
+
+  /**
+   * Will be triggered as a main-frame page load progresses.
+   * `progress` is a value from `0` to `1`.
+   *
+   * @since 8.11.0
+   */
+  addListener(
+    eventName: 'browserPageLoadProgress',
+    listenerFunc: (event: { id?: string; progress: number }) => void,
+  ): Promise<PluginListenerHandle>;
+
+  /**
    * Will be triggered when page load error
    */
   addListener(
     eventName: 'pageLoadError',
     listenerFunc: (event: { id?: string }) => void,
+  ): Promise<PluginListenerHandle>;
+  /**
+   * Will be triggered when the webview intercepts a non-standard custom scheme
+   * and hands it to the operating system.
+   *
+   * Standard OS-handled schemes such as `tel:`, `mailto:`, and `sms:` are excluded.
+   *
+   * @since 8.6.7
+   */
+  addListener(
+    eventName: 'customSchemeIntercepted',
+    listenerFunc: CustomSchemeInterceptedListener,
   ): Promise<PluginListenerHandle>;
   /**
    * Will be triggered after native download handling saves a file locally.
@@ -1381,6 +1948,27 @@ export interface InAppBrowserPlugin {
   updateDimensions(options: DimensionOptions & { id?: string }): Promise<void>;
 
   /**
+   * Enter or exit immersive fullscreen without recreating or reloading the webview.
+   * When `id` is omitted, targets the active webview. Repeated calls are idempotent.
+   * Entry requires a visible, frontmost, full-size `openWebView` on iOS or Android.
+   * Missing webviews, invalid arguments, custom dimensions, behind-host presentations,
+   * and the Web platform reject. Use the opening `fullscreen` option for an initially hidden webview.
+   * Disabling also cancels any pending fullscreen-at-launch request.
+   *
+   * Native exit controls, backgrounding, hiding, closing, cross-origin navigation, and renderer
+   * termination restore the original chrome even when host JavaScript cannot respond.
+   */
+  setFullscreen(options: { enabled: boolean; id?: string }): Promise<void>;
+
+  /**
+   * Read the applied host-controlled fullscreen state of an `openWebView`.
+   * When `id` is omitted, targets the active webview. Initially hidden fullscreen webviews
+   * report `false` until their first presentation. Missing webviews and Web usage reject.
+   * HTML/video fullscreen does not change this value.
+   */
+  getFullscreen(options?: { id?: string }): Promise<{ enabled: boolean }>;
+
+  /**
    * Sets the enabled safe top margin of the webview at runtime.
    * When `id` is omitted, targets the active webview.
    * On Web, this method is a no-op and resolves without changing layout.
@@ -1396,46 +1984,11 @@ export interface InAppBrowserPlugin {
 
   /**
    * Opens a secured window for OAuth2 authentication.
-   * For web, you should have the code in the redirected page to use a broadcast channel to send the redirected url to the app
-   * Something like:
-   * ```html
-   * <html>
-   * <head></head>
-   * <body>
-   * <script>
-   *   const searchParams = new URLSearchParams(location.search)
-   *   if (searchParams.has("code")) {
-   *     new BroadcastChannel("my-channel-name").postMessage(location.href);
-   *     window.close();
-   *   }
-   * </script>
-   * </body>
-   * </html>
-   * ```
-   * For mobile, you should have a redirect uri that opens the app, something like: `myapp://oauth_callback/`
-   * And make sure to register it in the app's info.plist:
-   * ```xml
-   * <key>CFBundleURLTypes</key>
-   * <array>
-   *    <dict>
-   *       <key>CFBundleURLSchemes</key>
-   *       <array>
-   *          <string>myapp</string>
-   *       </array>
-   *    </dict>
-   * </array>
-   * ```
-   * And in the AndroidManifest.xml file:
-   * ```xml
-   * <activity>
-   *    <intent-filter>
-   *       <action android:name="android.intent.action.VIEW" />
-   *       <category android:name="android.intent.category.DEFAULT" />
-   *       <category android:name="android.intent.category.BROWSABLE" />
-   *       <data android:host="oauth_callback" android:scheme="myapp" />
-   *    </intent-filter>
-   * </activity>
-   * ```
+   *
+   * On web, the redirect page should post the final URL to a `BroadcastChannel` and close itself.
+   * On mobile, register a custom redirect URI scheme (for example `myapp://oauth_callback/`) in Info.plist and AndroidManifest.xml.
+   * See the README section "openSecureWindow (OAuth)" for full setup examples.
+   *
    * @param options - the options for the openSecureWindow call
    */
   openSecureWindow(options: OpenSecureWindowOptions): Promise<OpenSecureWindowResponse>;

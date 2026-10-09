@@ -6,7 +6,9 @@ import type {
   OpenOptions,
   GetCookieOptions,
   ClearCookieOptions,
+  BringToFrontOptions,
   DimensionOptions,
+  DispatchInputEventOptions,
   OpenSecureWindowOptions,
   OpenSecureWindowResponse,
   ScreenshotResult,
@@ -19,6 +21,10 @@ export class InAppBrowserWeb extends WebPlugin implements InAppBrowserPlugin {
   }
   clearCache(): Promise<any> {
     console.log('clearCache');
+    return Promise.resolve();
+  }
+  clearAllBrowsingData(): Promise<any> {
+    console.log('clearAllBrowsingData');
     return Promise.resolve();
   }
   async open(options: OpenOptions): Promise<any> {
@@ -37,6 +43,9 @@ export class InAppBrowserWeb extends WebPlugin implements InAppBrowserPlugin {
   }
 
   async openWebView(options: OpenWebViewOptions): Promise<any> {
+    if (options.fullscreen) {
+      throw this.unimplemented('Fullscreen is only supported by native openWebView presentations.');
+    }
     console.log('openWebView', options);
     return options;
   }
@@ -58,6 +67,21 @@ export class InAppBrowserWeb extends WebPlugin implements InAppBrowserPlugin {
 
   async show(options?: { id?: string }): Promise<void> {
     console.log('show', options);
+    return;
+  }
+
+  async sendToBack(options?: { id?: string; transparentBackground?: boolean }): Promise<void> {
+    console.log('sendToBack not supported on web', options);
+    return;
+  }
+
+  async bringToFront(options?: BringToFrontOptions): Promise<void> {
+    console.log('bringToFront not supported on web', options);
+    return;
+  }
+
+  async dispatchInputEvent(options: DispatchInputEventOptions): Promise<void> {
+    console.log('dispatchInputEvent not supported on web', options);
     return;
   }
 
@@ -103,6 +127,16 @@ export class InAppBrowserWeb extends WebPlugin implements InAppBrowserPlugin {
   async setEnabledSafeTopMargin(options: { enabled: boolean; id?: string }): Promise<void> {
     console.log('setEnabledSafeTopMargin not supported on web', options);
     return;
+  }
+
+  async setFullscreen(options: { enabled: boolean; id?: string }): Promise<void> {
+    console.log('setFullscreen not supported on web', options);
+    throw this.unimplemented('Fullscreen is only supported by native openWebView presentations.');
+  }
+
+  async getFullscreen(options?: { id?: string }): Promise<{ enabled: boolean }> {
+    console.log('getFullscreen not supported on web', options);
+    throw this.unimplemented('Fullscreen is only supported by native openWebView presentations.');
   }
 
   async setEnabledSafeBottomMargin(options: { enabled: boolean; id?: string }): Promise<void> {
