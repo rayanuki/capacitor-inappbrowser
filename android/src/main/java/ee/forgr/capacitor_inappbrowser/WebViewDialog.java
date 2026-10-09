@@ -2350,6 +2350,8 @@ public class WebViewDialog extends ComponentDialog implements ProxyResponseRouti
         applyBackNavigationPolicy();
         setContentView(R.layout.activity_browser);
 
+        Window window = getWindow();
+
         // If custom dimensions are set, configure for touch passthrough
         if (
             _options != null &&
@@ -2396,9 +2398,12 @@ public class WebViewDialog extends ComponentDialog implements ProxyResponseRouti
                 .post(() -> {
                     // Get status bar height
                     int statusBarHeight = 0;
-                    int resourceId = getContext().getResources().getIdentifier("status_bar_height", "dimen", "android");
-                    if (resourceId > 0) {
-                        statusBarHeight = getContext().getResources().getDimensionPixelSize(resourceId);
+                    // [Rayanuki] Keep app fullscreen if toolBarType = "blank"  
+                    if(_options != null && _options.getToolbarType() != null && !TextUtils.equals(_options.getToolbarType(), "blank")){
+                        int resourceId = getContext().getResources().getIdentifier("status_bar_height", "dimen", "android");
+                        if (resourceId > 0) {
+                            statusBarHeight = getContext().getResources().getDimensionPixelSize(resourceId);
+                        }
                     }
 
                     // Find the status bar color view
