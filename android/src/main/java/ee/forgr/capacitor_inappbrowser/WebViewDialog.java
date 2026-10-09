@@ -368,6 +368,8 @@ public class WebViewDialog extends ComponentDialog implements ProxyResponseRouti
     }
 
     public void setFullscreen(boolean enabled) {
+        // [RAYANUKI]
+        if (_options != null && TextUtils.equals(_options.getToolbarType(), "blank")) return;
         if (!enabled && _options != null) _options.setFullscreen(false);
         if (enabled == isFullscreen()) return;
         if (enabled) {
@@ -2375,6 +2377,12 @@ public class WebViewDialog extends ComponentDialog implements ProxyResponseRouti
         // Set dimensions if specified, otherwise fullscreen
         applyDimensions();
 
+        //[rayanuki]
+        if (_options != null && TextUtils.equals(_options.getToolbarType(), "blank")){
+            FullscreenWindowState windowState = new FullscreenWindowState(Objects.requireNonNull(getWindow()));
+            windowState.enter();
+        }
+
         SystemUiChromeSupport.prepareInitialDialogWindow(getWindow(), findViewById(R.id.status_bar_color_view));
 
         WindowInsetsControllerCompat insetsController = new WindowInsetsControllerCompat(
@@ -3294,7 +3302,10 @@ public class WebViewDialog extends ComponentDialog implements ProxyResponseRouti
         }
 
         if (mediaFullscreenWindow != null) {
-            mediaFullscreenWindow.restore();
+            //[rayanuki]
+            if (_options != null && !TextUtils.equals(_options.getToolbarType(), "blank")){
+                mediaFullscreenWindow.restore();
+            }
             mediaFullscreenWindow = null;
         }
         if (nativeFullscreenWindow != null) {
